@@ -72,13 +72,13 @@ def volatility(candles, period=10):
     
     return volatilities
 
-def market_regime(prices, period=20, threshold=0.015):
+def market_regime(closes, period=20, threshold=0.015):
     regimes = []
-    for i in  range(period, len(prices)):
-        start_price = prices[i - period]
-        end_price = prices[i]
+    for i in  range(period, len(closes)):
+        old_price = closes[i - period]
+        current_price = closes[i]
 
-        change = abs(end_price - start_price) / start_price
+        change = abs(current_price - old_price) / old_price
         if change > threshold:
             regimes.append("TREND")
         else:
