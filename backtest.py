@@ -72,10 +72,6 @@ def run_backtest(symbol="BTCUSDT"):
     print("AVG VOLUMES:",len(avg_volumes))
     print("VOLATILITY VALUES:", len(volatility_values))
     print("REGIMES:", len(regimes))
-
-    print("DATASET SIZE:",len(X))
-    print("TRAIN SIZE:", len(X_train))
-    print("TEST SIZE:", len(X_test))
     
     if len(X_train) == 0 or len(y_train) == 0:
         print("ERROR: training dataset is empty")
