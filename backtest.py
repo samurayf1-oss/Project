@@ -24,6 +24,9 @@ def run_backtest(symbol="BTCUSDT"):
 
     start_index = 20
 
+    print("FOR START:", start_index)
+    print("FOR END:", len(ema_values) - 5)
+
     for i in range(start_index, len(ema_values) - 5):
         price = closes[i]
         future_price = closes[i + 5]
@@ -49,6 +52,9 @@ def run_backtest(symbol="BTCUSDT"):
 
         label = 1 if future_price > price else 0
 
+        # print("features:", features)
+        # print("LABEL:", label)
+
         X.append(features)
         y.append(label)
     
@@ -59,10 +65,22 @@ def run_backtest(symbol="BTCUSDT"):
     X_test = X[split:]
     y_test = y[split:]
     
+    print("CANDLES COUNT IN BACKTEST:",len(candles))
+    print("EMA VALUES:", len(ema_values))
+    print("RSI VALUES:", len(rsi_values))
+    print("MOMENTUM VALUES:", len(momentum_values))
+    print("AVG VOLUMES:",len(avg_volumes))
+    print("VOLATILITY VALUES:", len(volatility_values))
+    print("REGIMES:", len(regimes))
+
     print("DATASET SIZE:",len(X))
     print("TRAIN SIZE:", len(X_train))
     print("TEST SIZE:", len(X_test))
     
+    if len(X_train) == 0 or len(y_train) == 0:
+        print("ERROR: training dataset is empty")
+        return
+
     model = train_model(X_train, y_train)
     show_feature_importance(model)
     wins = 0

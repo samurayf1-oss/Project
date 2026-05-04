@@ -1,12 +1,18 @@
 def ema(prices, period=14):
+    if len(prices) < period:
+        return []
+    
+    ema_values = []
     multiplier = 2 / (period + 1)
-    ema_values = [sum(prices[:period]) / period]
+
+    sma = sum(prices[:period]) / period
+    ema_values.append(sma)
 
     for price in prices[period:]:
-        new_ema = (price - ema_values[-1]) * multiplier + ema_values[-1]
-        ema_values.append(new_ema)
+        ema_value = (price - ema_values[-1]) * multiplier + ema_values[-1]
+        ema_values.append(ema_value)
 
-        return ema_values
+    return ema_values
     
 def rsi(prices, period=14):
     gains = []
@@ -74,7 +80,7 @@ def market_regime(prices, period=20, threshold=0.015):
 
         change = abs(end_price - start_price) / start_price
         if change > threshold:
-            regimes.append("TDEND")
+            regimes.append("TREND")
         else:
             regimes.append("RANGE")
     return regimes

@@ -10,24 +10,29 @@ def get_price(symbol="BTCUSDT"):
     ticker = session.get_tickers(category="spot", symbol =symbol)
     return float(ticker["result"]["list"][0]["lastPrice"])
 
-def get_klines(symbol="BTCUSDT", interval="60", limit=50):
+def get_klines(symbol="BTCUSDT", interval="60", limit=200):
     response = session.get_kline(
-        category="spot",
+        category="linear",
         symbol=symbol,
         interval=interval,
         limit=limit
     )
 
-    candles = response["result"]["list"]
+    raw_candles = response["result"]["list"]
+    
+    candles = []
 
-    result = []
-    for candle in candles:
-        result.append({
-            "time": candle[0],
-            "open": float(candle[1]),
-            "high": float(candle[2]),
-            "low": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5]),
-        })
-    return result
+    for item in raw_candles:
+         candles.append({
+              "timestamp": int(item[0]),
+              "open": float(item[1]),
+              "high": float(item[2]),
+              "low": float(item[3]),
+              "close": float(item[4]),
+              "volume": float(item[5]),
+              "turnover": float(item[6])
+         })
+    
+    candles.reverse()
+
+    return candles
