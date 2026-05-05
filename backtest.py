@@ -113,11 +113,14 @@ def run_backtest(symbol="BTCUSDT"):
     print("CONFIDENCE TEST")
     print("conf | trades | wins | losses | winrate | avg_return | total_return | drawdown | profit_factor")
 
+    results = []
+
     for min_confidence in confidence_levels:
         returns = []
         equity_curve = [1.0]
 
         for i in range(len(X_test)):
+            
             probability = model.predict_proba([X_test[i]])[0]
             
             sell_confidence = probability[0]
@@ -170,6 +173,18 @@ def run_backtest(symbol="BTCUSDT"):
                 max_drawdown = drawdown
             
         max_drawdown *= 100
+        
+        results.append({
+            "confidence": min_confidence,
+            "trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "winrate": winrate,
+            "avg_return": avg_return,
+            "total_return": total_return,
+            "max_drawdown": max_drawdown,
+            "profit_factor": profit_factor
+        })
 
         print(
             min_confidence,
@@ -190,3 +205,34 @@ def run_backtest(symbol="BTCUSDT"):
             "|",
             round(profit_factor, 2)
         )
+
+    valid_results = [
+        result for result in results
+        if result["trades"] >= 50
+        and result["profit_factor"] >= 1.2
+        and result["total_return"] > 0
+        and result["max_drawdown"] <= 15
+    ]
+
+    if valid_results:
+        best_result = max(valid_results, key=lambda result: result["profit_factor"])
+        print()
+        print("BEST RESULT")
+        print("confidence:", best_result["confidence"])
+        print("trades:", best_result["trades"])
+        print("winrate:", round(best_result["winrate"]))
+        print("total_return:", round(best_result["total_return"], 2), "%")
+        print("max_drawdown:", round(best_result["max_drawdown"], 2), "%")
+        print("profit_factor:", round(best_result["profit_factor"], 2))
+        print("STATUS: PASSED")
+        best_result["symbol"] = symbol
+        best_result["status"] = "PASSED"
+        return best_result
+    else:
+        print()
+        print("BEST RESULT")
+        print("STATUS: FAILED")
+        return{
+            "symbol": symbol,
+            "status": "FAILED"
+        }
