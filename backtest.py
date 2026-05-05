@@ -9,7 +9,8 @@ from features import (
 from model import train_model, predict_signal, show_feature_importance
 
 def run_backtest(symbol="BTCUSDT"):
-    candles = get_klines(symbol, limit=200)
+    candles = get_klines(symbol, limit=1000)
+    print("CANDLES LOADED:", len(candles))
     closes = [candle["close"] for candle in candles]
 
     ema_values = ema(closes)
@@ -22,10 +23,13 @@ def run_backtest(symbol="BTCUSDT"):
     X = []
     y = []
 
+    prices = []
+    future_prices = []
+
     start_index = 20
 
-    print("FOR START:", start_index)
-    print("FOR END:", len(ema_values) - 5)
+    # print("FOR START:", start_index)
+    # print("FOR END:", len(ema_values) - 5)
 
     for i in range(start_index, len(ema_values) - 5):
         price = closes[i]
@@ -50,28 +54,41 @@ def run_backtest(symbol="BTCUSDT"):
             normalize_volatility(current_volatility, current_avg_volatility)
         ]
 
-        label = 1 if future_price > price else 0
+        target_return = (future_price - price) / price
+        min_move = 0.002    # 0.2%
+        if target_return > min_move:
+            label = 1
+        elif target_return < -min_move:
+            label = 0
+        else:
+            continue
 
         # print("features:", features)
         # print("LABEL:", label)
 
         X.append(features)
         y.append(label)
+        
+        prices.append(price)
+        future_prices.append(future_price)
     
-    split = int(len(X) * 0.8)
+    split_index = int(len(X) * 0.8)
 
-    X_train = X[:split]
-    y_train = y[:split]
-    X_test = X[split:]
-    y_test = y[split:]
+    X_train = X[:split_index]
+    y_train = y[:split_index]
+    X_test = X[split_index:]
+    y_test = y[split_index:]
+
+    test_prices = prices[split_index:]
+    test_future_prices = future_prices[split_index:]
     
-    print("CANDLES COUNT IN BACKTEST:",len(candles))
-    print("EMA VALUES:", len(ema_values))
-    print("RSI VALUES:", len(rsi_values))
-    print("MOMENTUM VALUES:", len(momentum_values))
-    print("AVG VOLUMES:",len(avg_volumes))
-    print("VOLATILITY VALUES:", len(volatility_values))
-    print("REGIMES:", len(regimes))
+    # print("CANDLES COUNT IN BACKTEST:",len(candles))
+    # print("EMA VALUES:", len(ema_values))
+    # print("RSI VALUES:", len(rsi_values))
+    # print("MOMENTUM VALUES:", len(momentum_values))
+    # print("AVG VOLUMES:",len(avg_volumes))
+    # print("VOLATILITY VALUES:", len(volatility_values))
+    # print("REGIMES:", len(regimes))
     
     if len(X_train) == 0 or len(y_train) == 0:
         print("ERROR: training dataset is empty")
@@ -79,23 +96,76 @@ def run_backtest(symbol="BTCUSDT"):
 
     model = train_model(X_train, y_train)
     show_feature_importance(model)
+    
     wins = 0
     losses = 0
+    returns = []
+    equity_curve = [1.0]
 
-    for features, real in zip(X_test, y_test):
-        signal, confidence = predict_signal(model, features)
+    commission = 0.001 # 0.1% потом нужно уточнить
 
-        pred = 1 if signal == "BUY" else 0
+    for i in range(len(X_test)):
+        probability = model.predict_proba([X_test[i]])[0]
+        sell_confidence = probability[0]
+        buy_confidence = probability[1]
 
-        if pred == real:
-            wins += 1
+        min_confidence = 0.55
+
+        if buy_confidence > min_confidence:
+            prediction = 1
+        elif sell_confidence > min_confidence:
+            prediction = 0
         else:
-            losses += 1
+            continue
 
-    total = wins + losses
-    winrate = (wins / total * 100) if total > 0 else 0
+        entry_price = test_prices[i]
+        exit_price = test_future_prices[i]
 
+        price_return = (exit_price - entry_price) / entry_price
+
+        if prediction == 1:
+            trade_return = price_return - commission
+        else:
+            trade_return = -price_return - commission
+
+        returns.append(trade_return)
+        equity_curve.append(equity_curve[-1] * (1 + trade_return))
+    
+    total_trades = len(returns)
+    wins = sum(1 for r in returns if r > 0)
+    losses = sum(1 for r in returns if r <= 0)
+
+            
+    winrate = wins / total_trades * 100 if total_trades > 0 else 0
+
+    total_return = (equity_curve[-1] - 1) * 100
+    avg_return = sum(returns) / len(returns) * 100 if returns else 0
+
+    gross_profit = sum(r for r in returns if r > 0)
+    gross_loss = abs(sum(r for r in returns if r < 0))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
+    peak = equity_curve[0]
+    max_drawdown = 0
+
+    for equity in equity_curve:
+        if equity > peak:
+            peak = equity
+
+        drawdown = (peak - equity) / peak
+
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+            
+    max_drawdown *= 100
+
+    print()
     print("BACKTEST RESULT")
+    print("Total trades:", total_trades)
     print("Wins:", wins)
     print("Losses:", losses)
     print("Winrate:", round(winrate, 2), "%")
+    print("Average return:", round(avg_return, 4),"%")
+    print("Total return:", round(total_return, 2),"%")
+    print("Max drawdown:", round(max_drawdown, 2), "%")
+    print("Profit factor:", round(profit_factor, 2))

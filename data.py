@@ -10,7 +10,7 @@ def get_price(symbol="BTCUSDT"):
     ticker = session.get_tickers(category="spot", symbol =symbol)
     return float(ticker["result"]["list"][0]["lastPrice"])
 
-def get_klines(symbol="BTCUSDT", interval="60", limit=200):
+def get_klines(symbol="BTCUSDT", interval="60", limit=1000):
     response = session.get_kline(
         category="linear",
         symbol=symbol,
