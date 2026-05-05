@@ -6,3 +6,4 @@ __pycache__/
 signals_log.csv
 selected_symbols.csv
 live_signals.csv
+paper_trades.csv
