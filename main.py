@@ -1,3 +1,4 @@
+import csv
 from backtest import run_backtest
 
 symbols = [
@@ -60,3 +61,42 @@ print("FAILED SYMBOLS:")
 
 for symbol in failed_symbols:
     print(symbol)
+
+with open("selected_symbols.csv", "w", newline="", encoding="utf-8") as file:
+    writer = csv.writer(file)
+
+    writer.writerow([
+        "symbol",
+        "status",
+        "confidence",
+        "trades",
+        "winrate",
+        "total_return",
+        "max_drawdown",
+        "profit_factor"
+    ])
+
+    for result in passed_symbols:
+        writer.writerow([
+            result["symbol"],
+        result["status"],
+        result["confidence"],
+        result["trades"],
+        round(result["winrate"], 2),
+        round(result["total_return"], 2),        
+        round(result["max_drawdown"], 2),
+        round(result["profit_factor"], 2)
+        ])
+    for symbol in failed_symbols:
+        writer.writerow([
+            symbol,
+            "FAILED",
+            ""
+            "",
+            "",
+            "",
+            "",
+            ""
+        ])
+print()
+print("Saved selection to selected_symbols.csv")

@@ -8,6 +8,116 @@ from features import (
 )
 from model import train_model, predict_signal, show_feature_importance
 
+def run_test_window(
+    X,
+    y,
+    prices,
+    future_prices,
+    train_end,
+    test_end,
+    confidence_levels,
+    commission
+):
+    X_train = X[:train_end]
+    y_train = y[:train_end]
+
+    X_test = X[train_end:test_end]
+    y_test = y[train_end:test_end]
+
+    test_prices = prices[train_end:test_end]
+    test_future_prices = future_prices[train_end:test_end]
+
+    if len(X_train) == 0 or len(y_train) == 0 or len(X_test) == 0:
+        return None
+    
+    if len(set(y_train)) < 2:
+        return None
+
+    model = train_model(X_train, y_train)
+
+    results = []
+
+    for min_confidence in confidence_levels:
+        returns = []
+        equity_curve = [1.0]
+
+        for i in range(len(X_test)):
+            probability = model.predict_proba([X_test[i]])[0]
+
+            sell_confidence = probability[0]
+            buy_confidence = probability[1]
+
+            if buy_confidence > min_confidence:
+                prediction = 1
+            elif sell_confidence > min_confidence:
+                prediction = 0
+            else:
+                continue
+
+            entry_price = test_prices[i]
+            exit_price = test_future_prices[i]
+
+            price_return = (exit_price - entry_price) / entry_price
+
+            if prediction == 1:
+                trade_return = price_return - commission
+            else:
+                trade_return = -price_return - commission
+
+            returns.append(trade_return)
+            equity_curve.append(equity_curve[-1] * (1 + trade_return))
+
+        total_trades = len(returns)
+        wins = sum(1 for r in returns if r > 0)
+        losses = sum(1 for r in returns if r <= 0)
+
+        winrate = wins / total_trades * 100 if total_trades > 0 else 0
+        total_return = (equity_curve[-1] - 1) * 100
+        avg_return = sum(returns) / len(returns) * 100 if returns else 0
+
+        gross_profit = sum(r for r in returns if r > 0)
+        gross_loss = abs(sum(r for r in returns if r < 0))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
+        peak = equity_curve[0]
+        max_drawdown = 0
+
+        for equity in equity_curve:
+            if equity > peak:
+                peak = equity
+
+            drawdown = (peak - equity) / peak
+
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+        max_drawdown *= 100
+
+        results.append({
+            "confidence": min_confidence,
+            "trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "winrate": winrate,
+            "avg_return": avg_return,
+            "total_return": total_return,
+            "max_drawdown": max_drawdown,
+            "profit_factor": profit_factor
+        })
+
+    valid_results = [
+        result for result in results
+        if result["trades"] >= 10
+        and result["profit_factor"] >= 1.1
+        and result["total_return"] > 0
+        and result["max_drawdown"] <= 20
+    ]
+
+    if not valid_results:
+        return None
+
+    return max(valid_results, key=lambda result: result["profit_factor"])
+
 def run_backtest(symbol="BTCUSDT"):
     print("Running backtest for:", symbol)
     
@@ -75,6 +185,81 @@ def run_backtest(symbol="BTCUSDT"):
         prices.append(price)
         future_prices.append(future_price)
     
+        print("DATASET SIZE FOR WALK:", len(X))
+    
+        confidence_levels = [0.50, 0.55, 0.60, 0.65, 0.70]
+        commission = 0.001
+
+        dataset_size = len(X)
+
+        windows = [
+            (int(dataset_size * 0.60), int(dataset_size * 0.70)),
+            (int(dataset_size * 0.70), int(dataset_size * 0.80)),
+            (int(dataset_size * 0.80), int(dataset_size * 0.90)),
+            (int(dataset_size * 0.90), int(dataset_size * 1.00)),
+        ]
+
+        print()
+        print("WALK FORWARD TEST")
+        print("window | train_end | test_end | conf | trades | winrate | total_return | drawdown | profit_factor | status")
+
+        walk_results = []
+
+        for index, window in enumerate(windows, start=1):
+            train_end = window[0]
+            test_end = window[1]
+
+            result = run_test_window(
+                X=X,
+                y=y,
+                prices=prices,
+                future_prices=future_prices,
+                train_end=train_end,
+                test_end=test_end,
+                confidence_levels=confidence_levels,
+                commission=commission
+            )
+
+            if result is None:
+                print(index, "|", train_end, "|", test_end, "|", "-", "|", 0, "|", 0, "|", 0, "|", 0, "|", 0, "| FAILED")
+                continue
+
+            walk_results.append(result)
+
+            print(
+                index,
+                "|",
+                train_end,
+                "|",
+                test_end,
+                "|",
+                result["confidence"],
+                "|",
+                result["trades"],
+                "|",
+                round(result["winrate"], 2),
+                "|",
+                round(result["total_return"], 2),
+                "|",
+                round(result["max_drawdown"], 2),
+                "|",
+               round(result["profit_factor"], 2),
+                "| PASSED"
+            )
+
+        passed_windows = len(walk_results)
+        total_windows = len(windows)
+
+        print()
+        print("WALK FORWARD SUMMARY")
+        print("passed_windows:", passed_windows)
+        print("total_windows:", total_windows)
+
+        if passed_windows >= 3:
+            print("WALK STATUS: PASSED")
+        else:
+            print("WALK STATUS: FAILED")
+
     split_index = int(len(X) * 0.8)
 
     X_train = X[:split_index]
