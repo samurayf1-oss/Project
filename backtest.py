@@ -9,8 +9,11 @@ from features import (
 from model import train_model, predict_signal, show_feature_importance
 
 def run_backtest(symbol="BTCUSDT"):
-    candles = get_klines(symbol, limit=1000)
+    print("Running backtest for:", symbol)
+    
+    candles = get_klines(symbol=symbol, limit=1000, category="linear")
     print("CANDLES LOADED:", len(candles))
+    
     closes = [candle["close"] for candle in candles]
 
     ema_values = ema(closes)
@@ -103,69 +106,87 @@ def run_backtest(symbol="BTCUSDT"):
     equity_curve = [1.0]
 
     commission = 0.001 # 0.1% потом нужно уточнить
-
-    for i in range(len(X_test)):
-        probability = model.predict_proba([X_test[i]])[0]
-        sell_confidence = probability[0]
-        buy_confidence = probability[1]
-
-        min_confidence = 0.55
-
-        if buy_confidence > min_confidence:
-            prediction = 1
-        elif sell_confidence > min_confidence:
-            prediction = 0
-        else:
-            continue
-
-        entry_price = test_prices[i]
-        exit_price = test_future_prices[i]
-
-        price_return = (exit_price - entry_price) / entry_price
-
-        if prediction == 1:
-            trade_return = price_return - commission
-        else:
-            trade_return = -price_return - commission
-
-        returns.append(trade_return)
-        equity_curve.append(equity_curve[-1] * (1 + trade_return))
     
-    total_trades = len(returns)
-    wins = sum(1 for r in returns if r > 0)
-    losses = sum(1 for r in returns if r <= 0)
-
-            
-    winrate = wins / total_trades * 100 if total_trades > 0 else 0
-
-    total_return = (equity_curve[-1] - 1) * 100
-    avg_return = sum(returns) / len(returns) * 100 if returns else 0
-
-    gross_profit = sum(r for r in returns if r > 0)
-    gross_loss = abs(sum(r for r in returns if r < 0))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
-
-    peak = equity_curve[0]
-    max_drawdown = 0
-
-    for equity in equity_curve:
-        if equity > peak:
-            peak = equity
-
-        drawdown = (peak - equity) / peak
-
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
-            
-    max_drawdown *= 100
+    confidence_levels = [0.50, 0.55, 0.60, 0.65, 0.70]
 
     print()
-    print("BACKTEST RESULT")
-    print("Total trades:", total_trades)
-    print("Wins:", wins)
-    print("Losses:", losses)
-    print("Winrate:", round(winrate, 2), "%")
-    print("Average return:", round(avg_return, 4),"%")
-    print("Total return:", round(total_return, 2),"%")
-    print("Max drawdown:", round(max_drawdown, 2), "%")
-    print("Profit factor:", round(profit_factor, 2))
+    print("CONFIDENCE TEST")
+    print("conf | trades | wins | losses | winrate | avg_return | total_return | drawdown | profit_factor")
+
+    for min_confidence in confidence_levels:
+        returns = []
+        equity_curve = [1.0]
+
+        for i in range(len(X_test)):
+            probability = model.predict_proba([X_test[i]])[0]
+            
+            sell_confidence = probability[0]
+            buy_confidence = probability[1]
+
+            if buy_confidence > min_confidence:
+                prediction = 1
+            elif sell_confidence > min_confidence:
+                prediction = 0
+            else:
+                continue
+
+            entry_price = test_prices[i]
+            exit_price = test_future_prices[i]
+
+            price_return = (exit_price - entry_price) / entry_price
+
+            if prediction == 1:
+                trade_return = price_return - commission
+            else:
+                trade_return = -price_return - commission
+
+            returns.append(trade_return)
+            equity_curve.append(equity_curve[-1] * (1 + trade_return))
+    
+        total_trades = len(returns)
+        wins = sum(1 for r in returns if r > 0)
+        losses = sum(1 for r in returns if r <= 0)
+
+            
+        winrate = wins / total_trades * 100 if total_trades > 0 else 0
+
+        total_return = (equity_curve[-1] - 1) * 100
+        avg_return = sum(returns) / len(returns) * 100 if returns else 0
+
+        gross_profit = sum(r for r in returns if r > 0)
+        gross_loss = abs(sum(r for r in returns if r < 0))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
+        peak = equity_curve[0]
+        max_drawdown = 0
+
+        for equity in equity_curve:
+            if equity > peak:
+                peak = equity
+
+            drawdown = (peak - equity) / peak
+
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+            
+        max_drawdown *= 100
+
+        print(
+            min_confidence,
+            "|",
+            total_trades,
+            "|",
+            wins,
+            "|",
+            losses,
+            "|",
+            round(winrate, 2),
+            "|",
+            round(avg_return, 4),
+            "|",
+            round(total_return, 2),
+            "|",
+            round(max_drawdown, 2),
+            "|",
+            round(profit_factor, 2)
+        )
