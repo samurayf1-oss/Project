@@ -140,7 +140,7 @@ def append_trade(trade):
 def main():
     latest_signals = load_latest_signals()
     trades = load_trades()
-    open_trades = [trade for trade in trades if trade["status"] =="OPEN"]
+    open_trades = [trade for trade in trades if trade["status"] == "OPEN"]
 
     print()
     print("PAPER TRADING")
@@ -150,6 +150,11 @@ def main():
         symbol = item["symbol"]
         signal = item["signal"]
         confidence = item["confidence"]
+
+        if signal == "HOLD":
+            print(symbol, "| HOLD | no trade | -")
+            continue
+
         for trade in open_trades:
             if trade["symbol"] != symbol:
                 continue
@@ -161,45 +166,51 @@ def main():
                 trade["entry_price"],
                 current_price
             )
-            
+
             if current_pnl >= TAKE_PROFIT_PERCENT:
                 close_trade(trade, current_price, "TAKE_PROFIT")
                 print(symbol, "|", signal, "| closed by take profit |", current_price)
                 save_all_trades(trades)
-                return
+                continue
 
             if current_pnl <= -STOP_LOSS_PERCENT:
                 close_trade(trade, current_price, "STOP_LOSS")
                 print(symbol, "|", signal, "| closed by stop loss |", current_price)
                 save_all_trades(trades)
-                return
-            
-        if signal == "HOLD":
-            print(symbol, "| HOLD | no trade | -")
-            continue
-        
-        for trade in open_trades:
-            if trade["symbol"] == symbol and trade["side"] !=signal:
-                price + get_price(symbol)
+                continue
 
-                pnl_percent = calculate_pnl_percent(
-                    trade["side"],
-                    trade["entry_price"],
-                    price
-                )
-
-                trade["status"] = "CLOSED"
-                trade["closed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                trade["exit_price"] = price
-                trade["pnl_percent"] = round(pnl_percent, 4)
-
-                print(symbol,"|", signal, "| closed paper trade|", price)
-
+            if trade["side"] != signal:
+                close_trade(trade, current_price, "OPPOSITE_SIGNAL")
+                print(symbol, "|", signal, "| closed by opposite signal |", current_price)
                 save_all_trades(trades)
-                return
+                continue
+
+        open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
 
         if has_open_trade(symbol, open_trades):
-            print(symbol, "|", signal, "| already open | -")
+            for trade in open_trades:
+                if trade["symbol"] == symbol:
+                    current_price = get_price(symbol)
+
+                    current_pnl = calculate_pnl_percent(
+                        trade["side"],
+                        trade["entry_price"],
+                        current_price
+                    )
+
+                    print(
+                        symbol,
+                        "|",
+                        signal,
+                        "| already open |",
+                        current_price,
+                        "| pnl:",
+                        round(current_pnl, 4),
+                        "%"
+                    )
+
+                    break
+
             continue
 
         price = get_price(symbol)
@@ -221,6 +232,35 @@ def main():
 
         print(symbol, "|", signal, "| opened paper trade |", price)
 
+    print()
+    print("OPEN TRADES SUMMARY")
+    print("symbol | side | entry | current | pnl")
 
+    updated_trades = load_trades()
+    updated_open_trades = [trade for trade in updated_trades if trade["status"] == "OPEN"]
+
+    for trade in updated_open_trades:
+        symbol = trade["symbol"]
+        current_price = get_price(symbol)
+
+        current_pnl = calculate_pnl_percent(
+            trade["side"],
+            trade["entry_price"],
+            current_price
+        )
+
+        print(
+            symbol,
+            "|",
+            trade["side"],
+            "|",
+            trade["entry_price"],
+            "|",
+            current_price,
+            "|",
+            round(current_pnl, 4),
+            "%"
+        )
+        
 if __name__ == "__main__":
     main()
