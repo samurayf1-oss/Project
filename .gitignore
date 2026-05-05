@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .vscode/
 signals_log.csv
+selected_symbols.csv
+live_signals.csv
