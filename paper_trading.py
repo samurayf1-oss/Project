@@ -1,18 +1,19 @@
 import csv
 import os
 from datetime import datetime
-
+from settings import STOP_LOSS, TAKE_PROFIT, LEVERAGE
 from data import get_price
 
+SELECTED_SYMBOLS_FILE = "selected_symbols.csv"
 SIGNALS_FILE = "live_signals.csv"
 TRADES_FILE = "paper_trades.csv"
 
 TRADING_MODE = "futures"    # "spot" или "futures"
-TAKE_PROFIT_PERCENT = 0.7
-STOP_LOSS_PERCENT = 0.4
+# TAKE_PROFIT_PERCENT = 0.7
+# STOP_LOSS_PERCENT = 0.4
 
 POZITION_SIZE_USDT = 100
-LEVERAGE = 3
+# LEVERAGE = 3
 
 MAX_OPEN_TRADES = 3
 MAXDAILY_LOSS_USDT = -3
@@ -48,6 +49,23 @@ def load_latest_signals():
 
     return list(signals.values())
 
+def load_selected_symbols():
+    selected_symbols = []
+
+    if not os.path.exists(SELECTED_SYMBOLS_FILE):
+        print("ERROR: selected_symbols.csv not found")
+        return selected_symbols
+
+    with open(SELECTED_SYMBOLS_FILE, "r", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+
+        for row in reader:
+            if row["status"] != "PASSED":
+                continue
+
+            selected_symbols.append(row["symbol"])
+
+    return selected_symbols
 
 def load_trades():
     if not os.path.exists(TRADES_FILE):
@@ -73,14 +91,13 @@ def has_open_trade(symbol, open_trades):
 def calculate_pnl_percent(side, entry_price, exit_price):
     entry_price = float(entry_price)
     exit_price = float(exit_price)
+    
+    price_return = (exit_price - entry_price) / entry_price
 
     if side == "BUY":
-        return (exit_price - entry_price) / entry_price * 100
-
-    if side == "SELL":
-        return (entry_price - exit_price) / entry_price * 100
-
-    return 0
+        return price_return * LEVERAGE * 100
+    
+    return -price_return * LEVERAGE * 100
 
 def calculate_pnl_usdt(pnl_percent):
     if TRADING_MODE == "futures":
@@ -109,6 +126,9 @@ def calculate_trade_age_minutes(opened_at):
     return int(delta.total_seconds() // 60)
 
 def close_trade(trade, exit_price, reason):
+    exit_price = float(exit_price)
+    trade["entry_price"] = float(trade["entry_price"])
+
     pnl_percent = calculate_pnl_percent(
         trade["side"],
         trade["entry_price"],
@@ -256,8 +276,21 @@ def append_trade(trade):
 
 def main():
     latest_signals = load_latest_signals()
+    selected_symbols = load_selected_symbols()
+
+    if not selected_symbols:
+        print("No selected symbols for paper trading.")
+        return
+    latest_signals = [
+        item for item in latest_signals
+        if item["symbol"] in selected_symbols
+    ]
     trades = load_trades()
-    open_trades = [trade for trade in trades if trade["status"] == "OPEN"]
+    open_trades = [
+        trade for trade in trades
+        if trade["status"] == "OPEN"
+        and trade["symbol"] in selected_symbols
+    ]
 
     print()
     print("PAPER TRADING")
@@ -295,14 +328,17 @@ def main():
                 trade_was_closed = True
                 break
 
-            if current_pnl >= TAKE_PROFIT_PERCENT:
+            take_profit_pnl = TAKE_PROFIT * LEVERAGE * 100
+            stop_loss_pnl = STOP_LOSS * LEVERAGE * 100
+                
+            if current_pnl >= take_profit_pnl:
                 close_trade(trade, current_price, "TAKE_PROFIT")
                 print(symbol, "|", signal, "| closed by take profit |", current_price)
                 save_all_trades(trades)
                 trade_was_closed = True
                 break
 
-            if current_pnl <= -STOP_LOSS_PERCENT:
+            if current_pnl <= -stop_loss_pnl:
                 close_trade(trade, current_price, "STOP_LOSS")
                 print(symbol, "|", signal, "| closed by stop loss |", current_price)
                 save_all_trades(trades)
@@ -315,7 +351,8 @@ def main():
                 save_all_trades(trades)
                 trade_was_closed = True
                 break
-
+        if trade_was_closed:
+            continue
         open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
 
         if has_open_trade(symbol, open_trades):

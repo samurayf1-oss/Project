@@ -21,7 +21,11 @@ for symbol in symbols:
     try:
         result = run_backtest(symbol)
 
-        if result["status"] == "PASSED":
+        if (
+            result.get("status") == "PASSED"
+            and result.get("walk_status") == "PASSED"
+            and result.get("final_status") == "PASSED"
+        ):
             passed_symbols.append(result)
         else:
             failed_symbols.append(symbol)
@@ -35,6 +39,15 @@ print()
 print("=" * 50)
 print("FINAL SELECTION")
 print("=" * 50)
+
+symbol_selection_status = "PASSED" if len(passed_symbols) > 0 else "FAILED"
+final_bot_status = symbol_selection_status
+
+print("SYMBOL_SELECTION_STATUS:", symbol_selection_status)
+print("FINAL_BOT_STATUS:", final_bot_status)
+if final_bot_status == "FAILED":
+    print("WARNING: No fully validated symbols. Use paper trading / observation only.")
+    print()
 
 print()
 print("PASSED SYMBOLS:")

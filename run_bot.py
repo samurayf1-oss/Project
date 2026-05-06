@@ -21,7 +21,7 @@ def run_script(script_name):
 
 
 def main():
-    interval_minutes = 1
+    interval_minutes = 5
     interval_seconds = interval_minutes * 60
 
     while True:
@@ -40,9 +40,9 @@ def main():
             if not paper_ok:
                 print("Bot cycle stopped because paper_trading.py failed")
             else:
-                report_ok = run_script("report.py")
+                report_ok = run_script("paper_report.py")
                 if not report_ok:
-                    print("Report failed")
+                    print("Paper report failed")
 
         print()
         print("=" * 50)
