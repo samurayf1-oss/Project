@@ -14,6 +14,9 @@ STOP_LOSS_PERCENT = 1.0
 POZITION_SIZE_USDT = 100
 LEVERAGE = 3
 
+MAX_OPEN_TRADES = 3
+MAXDAILY_LOSS_USDT = -3
+MAX_HOLD_MINUTES = 240
 
 def load_latest_signals():
     if not os.path.exists(SIGNALS_FILE):
@@ -97,6 +100,14 @@ def calculate_trade_age(opened_at):
 
     return f"{hours}h {minutes}m"
 
+def calculate_trade_age_minutes(opened_at):
+    opened_time = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+    current_time = datetime.now()
+
+    delta = current_time - opened_time
+
+    return int(delta.total_seconds() // 60)
+
 def close_trade(trade, exit_price, reason):
     pnl_percent = calculate_pnl_percent(
         trade["side"],
@@ -135,6 +146,28 @@ def save_all_trades(trades):
         for trade in trades:
             writer.writerow(trade)
 
+def get_today_closed_pnl_usdt():
+    trades = load_trades()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    daily_pnl = 0
+
+    for trade in trades:
+        if trade["status"] != "CLOSED":
+            continue
+        
+        if trade["closed_at"] == "":
+            continue
+
+        if not trade["closed_at"].startswith(today):
+            continue
+
+        if "pnl_usdt" not in trade or trade["pnl_usdt"] == "":
+            continue
+
+        daily_pnl += float(trade["pnl_usdt"])
+    return daily_pnl
+
 def print_portfolio_summary():
     trades = load_trades()
 
@@ -172,6 +205,14 @@ def print_portfolio_summary():
 
     total_pnl = open_pnl + closed_pnl
     total_pnl_usdt = open_pnl_usdt + closed_pnl_usdt
+    
+    today_closed_pnl_usdt = get_today_closed_pnl_usdt()
+    
+    if today_closed_pnl_usdt <= MAXDAILY_LOSS_USDT:
+        daily_risk_status = "BLOCKED"
+    else:
+        daily_risk_status = "ACTIV"
+
 
     print()
     print("PORTFOLIO SUMMARY")
@@ -183,6 +224,9 @@ def print_portfolio_summary():
     print("closed pnl_usdt:", round(closed_pnl_usdt, 4), "USDT")
     print("total pnl:", round(total_pnl, 4), "%")
     print("total pnl_usdt:", round(total_pnl_usdt, 4), "USDT")
+    print("daily closed pnl_usdt:", round(today_closed_pnl_usdt, 4), "USDT")
+    print("daily loss limit:", MAXDAILY_LOSS_USDT, "USDT")
+    print("daily risk status:", daily_risk_status)
 
 def append_trade(trade):
     file_exists = os.path.exists(TRADES_FILE)
@@ -240,6 +284,14 @@ def main():
                 current_price
             )
 
+            trade_age_minutes = calculate_trade_age_minutes(trade["opened_at"])
+
+            if trade_age_minutes >= MAX_HOLD_MINUTES:
+                close_trade(trade, current_price, "TIME_EXIT")
+                print(symbol, "|", signal, "| closed by time exit |", current_price)
+                save_all_trades(trades)
+                continue
+
             if current_pnl >= TAKE_PROFIT_PERCENT:
                 close_trade(trade, current_price, "TAKE_PROFIT")
                 print(symbol, "|", signal, "| closed by take profit |", current_price)
@@ -289,6 +341,17 @@ def main():
         if TRADING_MODE == "spot" and signal == "SELL":
             print(symbol , "| SELL | ignored on spot | -")
             continue
+        
+        open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
+        
+        if len(open_trades) >= MAX_OPEN_TRADES:
+            print(symbol, "|", signal, "| skipped max open trades | -")
+            continue
+        
+        today_pnl_usdt = get_today_closed_pnl_usdt()
+        
+        if today_pnl_usdt <= MAXDAILY_LOSS_USDT:
+            print(symbol, "|", signal, "| skipped daily loss limit |", round(today_pnl_usdt, 4), "USDT")
 
         price = get_price(symbol)
 

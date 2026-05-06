@@ -39,6 +39,10 @@ def main():
 
             if not paper_ok:
                 print("Bot cycle stopped because paper_trading.py failed")
+            else:
+                report_ok = run_script("report.py")
+                if not report_ok:
+                    print("Report failed")
 
         print()
         print("=" * 50)
