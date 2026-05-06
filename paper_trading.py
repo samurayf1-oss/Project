@@ -8,15 +8,15 @@ SIGNALS_FILE = "live_signals.csv"
 TRADES_FILE = "paper_trades.csv"
 
 TRADING_MODE = "futures"    # "spot" или "futures"
-TAKE_PROFIT_PERCENT = 1.5
-STOP_LOSS_PERCENT = 1.0
+TAKE_PROFIT_PERCENT = 0.7
+STOP_LOSS_PERCENT = 0.4
 
 POZITION_SIZE_USDT = 100
 LEVERAGE = 3
 
 MAX_OPEN_TRADES = 3
 MAXDAILY_LOSS_USDT = -3
-MAX_HOLD_MINUTES = 240
+MAX_HOLD_MINUTES = 60
 
 def load_latest_signals():
     if not os.path.exists(SIGNALS_FILE):
@@ -271,6 +271,8 @@ def main():
         if signal == "HOLD":
             print(symbol, "| HOLD | no trade | -")
             continue
+        
+        trade_was_closed = False
 
         for trade in open_trades:
             if trade["symbol"] != symbol:
@@ -290,29 +292,34 @@ def main():
                 close_trade(trade, current_price, "TIME_EXIT")
                 print(symbol, "|", signal, "| closed by time exit |", current_price)
                 save_all_trades(trades)
-                continue
+                trade_was_closed = True
+                break
 
             if current_pnl >= TAKE_PROFIT_PERCENT:
                 close_trade(trade, current_price, "TAKE_PROFIT")
                 print(symbol, "|", signal, "| closed by take profit |", current_price)
                 save_all_trades(trades)
-                continue
+                trade_was_closed = True
+                break
 
             if current_pnl <= -STOP_LOSS_PERCENT:
                 close_trade(trade, current_price, "STOP_LOSS")
                 print(symbol, "|", signal, "| closed by stop loss |", current_price)
                 save_all_trades(trades)
-                continue
+                trade_was_closed = True
+                break
 
             if trade["side"] != signal:
                 close_trade(trade, current_price, "OPPOSITE_SIGNAL")
                 print(symbol, "|", signal, "| closed by opposite signal |", current_price)
                 save_all_trades(trades)
-                continue
+                trade_was_closed = True
+                break
 
         open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
 
         if has_open_trade(symbol, open_trades):
+
             for trade in open_trades:
                 if trade["symbol"] == symbol:
                     current_price = get_price(symbol)
