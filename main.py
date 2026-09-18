@@ -104,7 +104,7 @@ with open("selected_symbols.csv", "w", newline="", encoding="utf-8") as file:
         writer.writerow([
             symbol,
             "FAILED",
-            ""
+            "",
             "",
             "",
             "",

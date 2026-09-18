@@ -18,6 +18,7 @@ POZITION_SIZE_USDT = 100
 MAX_OPEN_TRADES = 3
 MAXDAILY_LOSS_USDT = -3
 MAX_HOLD_MINUTES = 60
+HOLD_EXTENSION_MINUTES = 180
 
 def load_latest_signals():
     if not os.path.exists(SIGNALS_FILE):
@@ -77,6 +78,10 @@ def load_trades():
         reader = csv.DictReader(file)
 
         for row in reader:
+            if None in row:
+                row.pop(None, None)
+            if "max_hold_minutes" not in row or row["max_hold_minutes"] == "":
+                row["max_hold_minutes"] = str(MAX_HOLD_MINUTES)
             trades.append(row)
 
     return trades
@@ -101,7 +106,8 @@ def calculate_pnl_percent(side, entry_price, exit_price):
 
 def calculate_pnl_usdt(pnl_percent):
     if TRADING_MODE == "futures":
-        return POZITION_SIZE_USDT * (pnl_percent * LEVERAGE) / 100
+        # pnl_percent already includes leverage from calculate_pnl_percent
+        return POZITION_SIZE_USDT * pnl_percent / 100
     return POZITION_SIZE_USDT * pnl_percent / 100
 
 def calculate_trade_age(opened_at):
@@ -124,6 +130,18 @@ def calculate_trade_age_minutes(opened_at):
     delta = current_time - opened_time
 
     return int(delta.total_seconds() // 60)
+
+
+def get_trade_hold_limit_minutes(trade):
+    value = trade.get("max_hold_minutes", "")
+
+    if value == "":
+        return MAX_HOLD_MINUTES
+
+    try:
+        return int(float(value))
+    except ValueError:
+        return MAX_HOLD_MINUTES
 
 def close_trade(trade, exit_price, reason):
     exit_price = float(exit_price)
@@ -156,14 +174,17 @@ def save_all_trades(trades):
         "exit_price",
         "pnl_percent",
         "pnl_usdt",
-        "close_reason"
+        "close_reason",
+        "max_hold_minutes"
     ]
 
     with open(TRADES_FILE, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
         for trade in trades:
+            if None in trade:
+                trade.pop(None, None)
             writer.writerow(trade)
 
 def get_today_closed_pnl_usdt():
@@ -263,15 +284,72 @@ def append_trade(trade):
             "exit_price",
             "pnl_percent",
             "pnl_usdt",
-            "close_reason"
+            "close_reason",
+            "max_hold_minutes"
         ]
 
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
 
         if not file_exists:
             writer.writeheader()
 
         writer.writerow(trade)
+
+
+def manage_open_trades(trades, selected_symbols, latest_signals_map):
+    open_trades = [
+        trade for trade in trades
+        if trade["status"] == "OPEN"
+        and trade["symbol"] in selected_symbols
+    ]
+    if not open_trades:
+        return
+
+    for trade in open_trades:
+        symbol = trade["symbol"]
+        current_price = get_price(symbol)
+        current_pnl = calculate_pnl_percent(
+            trade["side"],
+            trade["entry_price"],
+            current_price
+        )
+        trade_age_minutes = calculate_trade_age_minutes(trade["opened_at"])
+
+        # current_pnl is leveraged percent, so compare to plain percent targets
+        take_profit_pnl = TAKE_PROFIT * 100
+        stop_loss_pnl = STOP_LOSS * 100
+
+        if current_pnl >= take_profit_pnl:
+            close_trade(trade, current_price, "TAKE_PROFIT")
+            print(symbol, "| manage | closed by take profit |", current_price)
+            continue
+
+        if current_pnl <= -stop_loss_pnl:
+            close_trade(trade, current_price, "STOP_LOSS")
+            print(symbol, "| manage | closed by stop loss |", current_price)
+            continue
+
+        signal = latest_signals_map.get(symbol, "HOLD")
+        if signal in {"BUY", "SELL"} and trade["side"] != signal:
+            close_trade(trade, current_price, "OPPOSITE_SIGNAL")
+            print(symbol, "| manage | closed by opposite signal |", current_price)
+            continue
+
+        hold_limit_minutes = get_trade_hold_limit_minutes(trade)
+        if trade_age_minutes >= hold_limit_minutes:
+            if current_pnl > 0:
+                close_trade(trade, current_price, "TIME_EXIT_IN_PROFIT")
+                print(symbol, "| manage | closed by time (profit) |", current_price)
+            else:
+                new_hold_limit = hold_limit_minutes + HOLD_EXTENSION_MINUTES
+                trade["max_hold_minutes"] = str(new_hold_limit)
+                print(
+                    symbol,
+                    "| manage | extended hold by 180m (loss), new limit:",
+                    f"{new_hold_limit}m"
+                )
+
+    save_all_trades(trades)
 
 
 def main():
@@ -285,6 +363,11 @@ def main():
         item for item in latest_signals
         if item["symbol"] in selected_symbols
     ]
+    latest_signals_map = {
+        item["symbol"]: item["signal"] for item in latest_signals
+    }
+    trades = load_trades()
+    manage_open_trades(trades, selected_symbols, latest_signals_map)
     trades = load_trades()
     open_trades = [
         trade for trade in trades
@@ -305,55 +388,11 @@ def main():
             print(symbol, "| HOLD | no trade | -")
             continue
         
-        trade_was_closed = False
-
-        for trade in open_trades:
-            if trade["symbol"] != symbol:
-                continue
-
-            current_price = get_price(symbol)
-
-            current_pnl = calculate_pnl_percent(
-                trade["side"],
-                trade["entry_price"],
-                current_price
-            )
-
-            trade_age_minutes = calculate_trade_age_minutes(trade["opened_at"])
-
-            if trade_age_minutes >= MAX_HOLD_MINUTES:
-                close_trade(trade, current_price, "TIME_EXIT")
-                print(symbol, "|", signal, "| closed by time exit |", current_price)
-                save_all_trades(trades)
-                trade_was_closed = True
-                break
-
-            take_profit_pnl = TAKE_PROFIT * LEVERAGE * 100
-            stop_loss_pnl = STOP_LOSS * LEVERAGE * 100
-                
-            if current_pnl >= take_profit_pnl:
-                close_trade(trade, current_price, "TAKE_PROFIT")
-                print(symbol, "|", signal, "| closed by take profit |", current_price)
-                save_all_trades(trades)
-                trade_was_closed = True
-                break
-
-            if current_pnl <= -stop_loss_pnl:
-                close_trade(trade, current_price, "STOP_LOSS")
-                print(symbol, "|", signal, "| closed by stop loss |", current_price)
-                save_all_trades(trades)
-                trade_was_closed = True
-                break
-
-            if trade["side"] != signal:
-                close_trade(trade, current_price, "OPPOSITE_SIGNAL")
-                print(symbol, "|", signal, "| closed by opposite signal |", current_price)
-                save_all_trades(trades)
-                trade_was_closed = True
-                break
-        if trade_was_closed:
-            continue
-        open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
+        open_trades = [
+            trade for trade in load_trades()
+            if trade["status"] == "OPEN"
+            and trade["symbol"] in selected_symbols
+        ]
 
         if has_open_trade(symbol, open_trades):
 
@@ -386,7 +425,11 @@ def main():
             print(symbol , "| SELL | ignored on spot | -")
             continue
         
-        open_trades = [trade for trade in load_trades() if trade["status"] == "OPEN"]
+        open_trades = [
+            trade for trade in load_trades()
+            if trade["status"] == "OPEN"
+            and trade["symbol"] in selected_symbols
+        ]
         
         if len(open_trades) >= MAX_OPEN_TRADES:
             print(symbol, "|", signal, "| skipped max open trades | -")
@@ -396,6 +439,7 @@ def main():
         
         if today_pnl_usdt <= MAXDAILY_LOSS_USDT:
             print(symbol, "|", signal, "| skipped daily loss limit |", round(today_pnl_usdt, 4), "USDT")
+            continue
 
         price = get_price(symbol)
 
@@ -410,7 +454,8 @@ def main():
             "exit_price": "",
             "pnl_percent": "",
             "pnl_usdt": "",
-            "close_reason": ""
+            "close_reason": "",
+            "max_hold_minutes": str(MAX_HOLD_MINUTES)
         }
 
         append_trade(trade)
