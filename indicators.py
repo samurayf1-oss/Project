@@ -1,3 +1,4 @@
+from math import isfinite
 def ema(prices, period=14):
     if len(prices) < period:
         return []
@@ -15,32 +16,43 @@ def ema(prices, period=14):
     return ema_values
     
 def rsi(prices, period=14):
-    gains = []
-    losses = []
+    if isinstance(period, bool) or not isinstance(period, int) or period <= 0:
+        raise ValueError("RSI period must be a positive integer")
 
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i - 1]
-        if change >0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+    prices = [float(value) for value in prices]
+    if not all(isfinite(value) for value in prices):
+        raise ValueError("RSI prices must be finite")
+
+    if len(prices) <= period:
+        return []
+
+    changes = [
+        prices[index] - prices[index - 1]
+        for index in range(1, len(prices))
+    ]
+    if not all(isfinite(value) for value in changes):
+        raise ValueError("RSI price changes must be finite")
+
+    gains = [max(value, 0.0) for value in changes]
+    losses = [max(-value, 0.0) for value in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
-    rsi_values = [100 - (100 / (1 + rs))]
+    def rsi_value(gain, loss):
+        total = gain + loss
+        if not isfinite(total):
+            raise ValueError("RSI averages must be finite")
+        return 50.0 if total == 0 else 100.0 * (gain / total)
 
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+    values = [rsi_value(avg_gain, avg_loss)]
 
-        rs = avg_gain / avg_loss if avg_loss !=0 else 0
-        rsi_values.append(100 - (100 / (1 + rs)))
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        values.append(rsi_value(avg_gain, avg_loss))
 
-    return rsi_values
+    return values
 
 def momentum(prices, period=5):
     values = []

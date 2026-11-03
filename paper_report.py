@@ -1,5 +1,6 @@
 import csv
 import os
+from imperator_monitor.run import shared_text
 
 TRADES_FILE = "paper_trades.csv"
 
@@ -9,7 +10,7 @@ def load_trades():
         print("paper_trades.csv not found")
         return []
 
-    with open(TRADES_FILE, "r", encoding="utf-8") as file:
+    with shared_text(TRADES_FILE) as file:
         reader = csv.DictReader(file)
         return list(reader)
 
@@ -24,8 +25,9 @@ def to_float(value):
         return 0.0
 
 
-def main():
-    trades = load_trades()
+def main(trades=None):
+    if trades is None:
+        trades = load_trades()
 
     if not trades:
         print("No paper trades found.")
@@ -42,7 +44,6 @@ def main():
     ]
 
     total_closed_pnl = sum(to_float(trade["pnl_usdt"]) for trade in closed_trades)
-    total_open_pnl = sum(to_float(trade["pnl_usdt"]) for trade in open_trades)
 
     wins = [
         trade for trade in closed_trades
@@ -98,7 +99,7 @@ def main():
     print("losses:", len(losses))
     print("winrate:", round(winrate, 2), "%")
     print("closed pnl usdt:", round(total_closed_pnl, 4))
-    print("open pnl usdt:", round(total_open_pnl, 4))
+    print("open pnl usdt: see live monitor")
 
     print()
     print("CLOSE REASONS")

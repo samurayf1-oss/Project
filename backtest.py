@@ -16,263 +16,318 @@ from features import (
     normalize_volatility
 )
 from model import train_model, predict_signal, show_feature_importance
+from math import isfinite
+PREDICTION_HORIZON = 5
 
-def simulate_trade(side, entry_price, future_candles, stop_loss, take_profit, leverage, commission):
-    for candle in future_candles:
-        high = candle["high"]
-        low = candle["low"]
-        close = candle["close"]
+
+def prepare_training_data(X, y, train_end):
+    if len(X) != len(y):
+        raise ValueError("Feature and label counts must match")
+
+    if not isinstance(train_end, int) or not 0 <= train_end <= len(X):
+        raise ValueError("Invalid training boundary")
+
+    safe_train_end = max(0, train_end - PREDICTION_HORIZON)
+
+    X_train = []
+    y_train = []
+
+    for features, label in zip(X[:safe_train_end], y[:safe_train_end]):
+        if label is None:
+            continue
+        if label not in (0, 1):
+            raise ValueError("Training labels must be 0, 1 or None")
+
+        X_train.append(features)
+        y_train.append(label)
+
+    return X_train, y_train
+def calculate_net_trade_return(side, entry_price, exit_price, leverage, commission):
+    if side not in {"BUY", "SELL"}:
+        raise ValueError(f"Invalid side: {side}")
+
+    entry_price = float(entry_price)
+    exit_price = float(exit_price)
+    leverage = float(leverage)
+    commission = float(commission)
+
+    values = (entry_price, exit_price, leverage, commission)
+    if (
+        not all(isfinite(value) for value in values)
+        or min(entry_price, exit_price, leverage) <= 0
+        or not 0 <= commission < 1
+    ):
+        raise ValueError("Invalid prices, leverage or commission")
+
+    ratio = exit_price / entry_price
+    direction = 1 if side == "BUY" else -1
+    net_return = leverage * (
+        direction * (ratio - 1) - commission * (1 + ratio)
+    )
+
+    if not isfinite(net_return):
+        raise ValueError("Calculated net return is not finite")
+
+    return net_return
+
+
+def simulate_trade_with_exit(
+    side, entry_price, future_candles,
+    stop_loss, take_profit, leverage, commission
+):
+    if side not in {"BUY", "SELL"} or not future_candles:
+        raise ValueError("Valid side and non-empty future candles required")
+
+    entry_price = float(entry_price)
+    stop_loss = float(stop_loss)
+    take_profit = float(take_profit)
+
+    if (
+        not all(isfinite(value) for value in (entry_price, stop_loss, take_profit))
+        or entry_price <= 0
+        or not 0 < stop_loss < 1
+        or not 0 < take_profit < 1
+    ):
+        raise ValueError("Invalid entry price or TP/SL")
+
+    stop_price = entry_price * (1 - stop_loss if side == "BUY" else 1 + stop_loss)
+    take_price = entry_price * (1 + take_profit if side == "BUY" else 1 - take_profit)
+
+    for bars_held, candle in enumerate(future_candles, start=1):
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+
+        if (
+            not all(isfinite(value) for value in (high, low, close))
+            or low <= 0
+            or not low <= close <= high
+        ):
+            raise ValueError("Invalid future candle")
+
+        exit_price = None
 
         if side == "BUY":
-            stop_price = entry_price * (1- stop_loss)
-            take_price = entry_price * (1 + take_profit)
-            
             if low <= stop_price:
-                return (-stop_loss * leverage) - commission
-            if high >= take_price:
-                return (take_profit * leverage) - commission
-            
-        if side == "SELL":
-            stop_price = entry_price * (1 + stop_loss)
-            take_price = entry_price * (1 - take_profit) 
-
+                exit_price = stop_price
+            elif high >= take_price:
+                exit_price = take_price
+        else:
             if high >= stop_price:
-                return (-stop_loss * leverage) - commission
-            if low <= take_price:
-                return (take_profit * leverage) - commission
-    
-    final_close = future_candles[-1]["close"]
-    price_return = (final_close - entry_price) / entry_price
-    
-    if side =="BUY":
-        return (price_return * leverage) - commission
-    return (-price_return * leverage) - commission
+                exit_price = stop_price
+            elif low <= take_price:
+                exit_price = take_price
 
-def run_test_window(
-    X,
-    y,
-    prices,
-    future_candles_list,
-    train_end,
-    test_end,
-    confidence_levels,
-    stop_loss,
-    take_profit,
-    leverage,
-    commission
+        if exit_price is not None:
+            net_return = calculate_net_trade_return(
+                side, entry_price, exit_price, leverage, commission
+            )
+            return net_return, bars_held
+
+    net_return = calculate_net_trade_return(
+        side, entry_price, future_candles[-1]["close"], leverage, commission
+    )
+    return net_return, len(future_candles)
+
+
+def simulate_trade(
+    side, entry_price, future_candles,
+    stop_loss, take_profit, leverage, commission
 ):
-    X_train = X[:train_end]
-    y_train = y[:train_end]
+    net_return, _ = simulate_trade_with_exit(
+        side, entry_price, future_candles,
+        stop_loss, take_profit, leverage, commission
+    )
+    return net_return
+def summarize_returns(returns):
+    returns = [float(value) for value in returns]
+    if any(not isfinite(value) or value <= -1 for value in returns):
+        raise ValueError("Invalid return for the model equity curve")
 
-    X_test = X[train_end:test_end]
-    y_test = y[train_end:test_end]
+    equity = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
 
-    test_prices = prices[train_end:test_end]
-    test_future_candles_list = future_candles_list[train_end:test_end]
+    for value in returns:
+        equity *= 1 + value
+        if not isfinite(equity):
+            raise ValueError("Model equity is not finite")
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, (peak - equity) / peak)
 
-    if len(X_train) == 0 or len(y_train) == 0 or len(X_test) == 0:
-        return None
-    
-    if len(set(y_train)) < 2:
-        return None
+    trades = len(returns)
+    wins = sum(value > 0 for value in returns)
+    gains = sum(value for value in returns if value > 0)
+    losses_sum = -sum(value for value in returns if value < 0)
+    profit_factor = (
+        gains / losses_sum if losses_sum > 0
+        else float("inf") if gains > 0 else 0.0
+    )
 
-    model = train_model(X_train, y_train)
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": trades - wins,
+        "winrate": wins / trades * 100 if trades else 0.0,
+        "avg_return": sum(returns) / trades * 100 if trades else 0.0,
+        "total_return": (equity - 1) * 100,
+        "max_drawdown": max_drawdown * 100,
+        "profit_factor": profit_factor,
+        "returns": returns
+    }
+def run_test_window(
+    X, y, prices, future_candles_list, train_end, test_end,
+    confidence_levels, stop_loss, take_profit, leverage, commission
+):
+    if not len(X) == len(y) == len(prices) == len(future_candles_list):
+        raise ValueError("Dataset columns must have equal lengths")
+    if not 0 <= train_end <= test_end <= len(X):
+        raise ValueError("Invalid temporal boundaries")
 
-    results = []
-
-    for min_confidence in confidence_levels:
-        returns = []
-        equity_curve = [1.0]
-
-        for i in range(len(X_test)):
-            probability = model.predict_proba([X_test[i]])[0]
-
-            sell_confidence = probability[0]
-            buy_confidence = probability[1]
-
-            if buy_confidence > min_confidence:
-                prediction = 1
-            elif sell_confidence > min_confidence:
-                prediction = 0
-            else:
-                continue
-
-            entry_price = test_prices[i]
-            future_candles = test_future_candles_list[i]
-
-            if prediction == 1:
-                trade_return = simulate_trade(
-                    side="BUY",
-                    entry_price=entry_price,
-                    future_candles=future_candles,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    leverage=leverage,
-                    commission=commission
-                )
-            else:
-                trade_return = simulate_trade(
-                    side="SELL",
-                    entry_price=entry_price,
-                    future_candles=future_candles,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    leverage=leverage,
-                    commission=commission
-                )
-
-            returns.append(trade_return)
-            equity_curve.append(equity_curve[-1] * (1 + trade_return))
-
-        total_trades = len(returns)
-        wins = sum(1 for r in returns if r > 0)
-        losses = sum(1 for r in returns if r <= 0)
-
-        winrate = wins / total_trades * 100 if total_trades > 0 else 0
-        total_return = (equity_curve[-1] - 1) * 100
-        avg_return = sum(returns) / len(returns) * 100 if returns else 0
-
-        gross_profit = sum(r for r in returns if r > 0)
-        gross_loss = abs(sum(r for r in returns if r < 0))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
-
-        peak = equity_curve[0]
-        max_drawdown = 0
-
-        for equity in equity_curve:
-            if equity > peak:
-                peak = equity
-
-            drawdown = (peak - equity) / peak
-
-            if drawdown > max_drawdown:
-                max_drawdown = drawdown
-
-        max_drawdown *= 100
-
-        results.append({
-            "confidence": min_confidence,
-            "trades": total_trades,
-            "wins": wins,
-            "losses": losses,
-            "winrate": winrate,
-            "avg_return": avg_return,
-            "total_return": total_return,
-            "max_drawdown": max_drawdown,
-            "profit_factor": profit_factor
+    def skipped(reason, validation_results=None):
+        result = summarize_returns([])
+        result.update({
+            "confidence": None,
+            "status": "SKIPPED",
+            "reason": reason,
+            "validation_results": validation_results or []
         })
+        return result
 
-    valid_results = [
-        result for result in results
-        if result["trades"] >= 10
+    validation_start = int(train_end * 0.8)
+    validation_end = train_end - PREDICTION_HORIZON
+    test_stop = test_end - PREDICTION_HORIZON
+
+    if validation_start >= validation_end or train_end >= test_stop:
+        return skipped("Not enough rows for validation and test")
+
+    X_fit, y_fit = prepare_training_data(X, y, validation_start)
+    X_refit, y_refit = prepare_training_data(X, y, train_end)
+    if len(set(y_fit)) < 2 or len(set(y_refit)) < 2:
+        return skipped("Training needs both BUY and SELL classes")
+
+    thresholds = [float(value) for value in confidence_levels]
+    if any(not isfinite(value) or not 0.5 <= value < 1 for value in thresholds):
+        raise ValueError("Confidence must be in [0.5, 1)")
+
+    def evaluate(model, confidence, start, end):
+        returns = []
+        index = start
+
+        while index < end:
+            sell, buy = map(float, model.predict_proba([X[index]])[0])
+            if (
+                not all(isfinite(value) and 0 <= value <= 1 for value in (sell, buy))
+                or abs(sell + buy - 1) > 1e-6
+            ):
+                raise ValueError("Invalid model probabilities")
+
+            if buy > confidence:
+                side = "BUY"
+            elif sell > confidence:
+                side = "SELL"
+            else:
+                index += 1
+                continue
+            trade_return, bars_held = simulate_trade_with_exit(
+                side, prices[index], future_candles_list[index],
+                stop_loss, take_profit, leverage, commission
+            )
+            returns.append(trade_return)
+
+            index += bars_held + 1
+
+        result = summarize_returns(returns)
+        result["confidence"] = confidence
+        return result
+    validation_model = train_model(X_fit, y_fit)
+    validation_results = [
+        evaluate(validation_model, value, validation_start, validation_end)
+        for value in thresholds
+    ]
+    candidates = [result for result in validation_results if result["trades"] >= 10]
+    if not candidates:
+        return skipped("No validation threshold has at least 10 trades", validation_results)
+
+    selected = max(
+        candidates,
+        key=lambda result: (
+            result["profit_factor"], result["avg_return"], -result["confidence"]
+        )
+    )
+
+    test_model = train_model(X_refit, y_refit)
+    result = evaluate(test_model, selected["confidence"], train_end, test_stop)
+    passed = (
+        result["trades"] >= 10
         and result["profit_factor"] >= 1.1
         and result["total_return"] > 0
         and result["max_drawdown"] <= 20
-    ]
-
-    if not valid_results:
-        return None
-
-    return max(valid_results, key=lambda result: result["profit_factor"])
-
+    )
+    result.update({
+        "status": "PASSED" if passed else "FAILED",
+        "validation_results": validation_results
+    })
+    return result
 def run_walk_forward(
-    X,
-    y,
-    prices,
-    future_candles_list,
-    stop_loss,
-    take_profit,
-    show_output=True
+    X, y, prices, future_candles_list, stop_loss, take_profit, show_output=True
 ):
-    dataset_size = len(X)
-
+    development_end = int(len(X) * 0.8)
     windows = [
-        (int(dataset_size * 0.60), int(dataset_size * 0.70)),
-        (int(dataset_size * 0.70), int(dataset_size * 0.80)),
-        (int(dataset_size * 0.80), int(dataset_size * 0.90)),
-        (int(dataset_size * 0.90), int(dataset_size * 1.00)),
+        (int(development_end * 0.60), int(development_end * 0.70)),
+        (int(development_end * 0.70), int(development_end * 0.80)),
+        (int(development_end * 0.80), int(development_end * 0.90)),
+        (int(development_end * 0.90), development_end)
     ]
+    results = []
 
     if show_output:
-        print()
-        print("WALK FORWARD TEST")
-        print("window | train_end | test_end | conf | trades | winrate | total_return | drawdown | profit_factor | status")
+        print("\nWALK FORWARD TEST — DEVELOPMENT DATA")
+        print("window | train_end | test_end | conf | trades | winrate | model_return | drawdown | PF | status")
 
-    walk_results = []
-
-    for index, window in enumerate(windows, start=1):
-        train_end = window[0]
-        test_end = window[1]
-
+    for number, (train_end, test_end) in enumerate(windows, start=1):
         result = run_test_window(
-            X=X,
-            y=y,
-            prices=prices,
-            future_candles_list=future_candles_list,
-            train_end=train_end,
-            test_end=test_end,
-            confidence_levels=CONFIDENCE_LEVELS,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            leverage=LEVERAGE,
-            commission=COMMISSION
+            X, y, prices, future_candles_list, train_end, test_end,
+            CONFIDENCE_LEVELS, stop_loss, take_profit, LEVERAGE, COMMISSION
         )
-
-        if result is None:
-            if show_output:
-                print(index, "|", train_end, "|", test_end, "|", "-", "|", 0, "|", 0, "|", 0, "|", 0, "|", 0, "| FAILED")
-            continue
-
-        walk_results.append(result)
+        results.append(result)
 
         if show_output:
             print(
-                index,
-                "|",
-                train_end,
-                "|",
-                test_end,
-                "|",
-                result["confidence"],
-                "|",
-                result["trades"],
-                "|",
-                round(result["winrate"], 2),
-                "|",
-                round(result["total_return"], 2),
-                "|",
-                round(result["max_drawdown"], 2),
-                "|",
-                round(result["profit_factor"], 2),
-                "| PASSED"
+                f"{number} | {train_end} | {test_end} | "
+                f"{result['confidence']} | {result['trades']} | "
+                f"{result['winrate']:.2f} | {result['total_return']:.2f} | "
+                f"{result['max_drawdown']:.2f} | {result['profit_factor']:.2f} | "
+                f"{result['status']}"
             )
+            if result["status"] == "SKIPPED":
+                print("reason:", result["reason"])
 
-    passed_windows = len(walk_results)
-    total_windows = len(windows)
-
-    total_trades = sum(result["trades"] for result in walk_results)
-    avg_profit_factor = (
-        sum(result["profit_factor"] for result in walk_results) / passed_windows
-        if passed_windows > 0
-        else 0
+    evaluated = [result for result in results if result["status"] != "SKIPPED"]
+    all_returns = [value for result in results for value in result["returns"]]
+    combined = summarize_returns(all_returns)
+    passed_windows = sum(result["status"] == "PASSED" for result in results)
+    passed = (
+        len(evaluated) == len(windows)
+        and passed_windows >= 3
+        and combined["trades"] >= 30
+        and combined["total_return"] > 0
+        and combined["profit_factor"] >= 1.1
+        and combined["max_drawdown"] <= 20
     )
-    avg_drawdown = (
-        sum(result["max_drawdown"] for result in walk_results) / passed_windows
-        if passed_windows > 0
-        else 0
-    )
-    total_return = sum(result["total_return"] for result in walk_results)
-
-    status = "PASSED" if passed_windows >= 3 else "FAILED"
+    status = "PASSED" if passed else "FAILED"
+    count = len(evaluated)
 
     if show_output:
-        print()
-        print("WALK FORWARD SUMMARY")
-        print("stop_loss:", stop_loss)
-        print("take_profit:", take_profit)
-        print("leverage:", LEVERAGE)
+        print("\nWALK FORWARD SUMMARY")
+        print("development_end:", development_end)
+        print("evaluated_windows:", count)
         print("passed_windows:", passed_windows)
-        print("total_windows:", total_windows)
+        print("total_windows:", len(windows))
+        print("total_trades:", combined["trades"])
+        print("model_return:", round(combined["total_return"], 2))
+        print("max_drawdown:", round(combined["max_drawdown"], 2))
+        print("profit_factor:", round(combined["profit_factor"], 2))
         print("WALK STATUS:", status)
 
     return {
@@ -280,11 +335,11 @@ def run_walk_forward(
         "take_profit": take_profit,
         "leverage": LEVERAGE,
         "passed_windows": passed_windows,
-        "total_windows": total_windows,
-        "total_trades": total_trades,
-        "total_return": total_return,
-        "avg_drawdown": avg_drawdown,
-        "avg_profit_factor": avg_profit_factor,
+        "total_windows": len(windows),
+        "total_trades": combined["trades"],
+        "total_return": combined["total_return"],
+        "avg_drawdown": sum(result["max_drawdown"] for result in evaluated) / count if count else 0.0,
+        "avg_profit_factor": sum(result["profit_factor"] for result in evaluated) / count if count else 0.0,
         "status": status
     }
 
@@ -331,7 +386,8 @@ def run_tp_sl_grid(X, y, prices, future_candles_list):
 
     valid_results = [
         result for result in grid_results
-        if result["passed_windows"] >= 3
+        if result["status"] == "PASSED"
+        and result["passed_windows"] >= 3
         and result["total_trades"] >= 30
         and result["total_return"] > 0
         and result["avg_profit_factor"] >= 1.1
@@ -368,15 +424,11 @@ def run_tp_sl_grid(X, y, prices, future_candles_list):
     print("avg_profit_factor:", round(best_result["avg_profit_factor"], 2))
 
     return best_result
+def build_backtest_dataset(candles, momentum_transform=None):
+    if momentum_transform is None:
+        momentum_transform = normalize_momentum
 
-def run_backtest(symbol="BTCUSDT"):
-    print("Running backtest for:", symbol)
-    
-    candles = get_klines(symbol=symbol, limit=1000, category="linear")
-    print("CANDLES LOADED:", len(candles))
-    
     closes = [candle["close"] for candle in candles]
-
     ema_values = ema(closes)
     rsi_values = rsi(closes)
     momentum_values = momentum(closes)
@@ -386,319 +438,135 @@ def run_backtest(symbol="BTCUSDT"):
 
     X = []
     y = []
-
     prices = []
-    future_prices = []
     future_candles_list = []
 
-    start_index = 20
-
-    # print("FOR START:", start_index)
-    # print("FOR END:", len(ema_values) - 5)
-
-    for i in range(start_index, len(ema_values) - 5):
+    for i in range(20, len(closes) - PREDICTION_HORIZON):
         price = closes[i]
-        future_price = closes[i + 5]
-        future_candles = candles[i + 1:i + 6]
+        future_price = closes[i + PREDICTION_HORIZON]
 
-        current_ema = ema_values[i - 14]
-        current_rsi = rsi_values[i - 14]
-        current_momentum = momentum_values[i - 5]
-        current_volume = candles[i]["volume"]
-        current_avg_volume = avg_volumes[i - 10]
-        current_volatility = candles[i]["high"] - candles[i]["low"]
-        current_avg_volatility = volatility_values[i - 10]
-        current_regime = 1 if regimes[i - 20] == "TREND" else 0
-
-
-        features = [ 
-            current_regime,
-            1 if price > current_ema else 0, 
-            normalize_rsi(current_rsi),  
-            normalize_momentum(current_momentum, price),
-            normalize_volume(current_volume, current_avg_volume),
-            normalize_volatility(current_volatility, current_avg_volatility)
+        features = [
+            1 if regimes[i - 20] == "TREND" else 0,
+            1 if price > ema_values[i - 13] else 0,
+            normalize_rsi(rsi_values[i - 14]),
+            momentum_transform(momentum_values[i - 5], price),
+            normalize_volume(candles[i]["volume"], avg_volumes[i - 10]),
+            normalize_volatility(
+                candles[i]["high"] - candles[i]["low"],
+                volatility_values[i - 10]
+            )
         ]
 
         target_return = (future_price - price) / price
-        min_move = 0.002    # 0.2%
-        if target_return > min_move:
+        if target_return > 0.002:
             label = 1
-        elif target_return < -min_move:
+        elif target_return < -0.002:
             label = 0
         else:
-            continue
-
-        # print("features:", features)
-        # print("LABEL:", label)
+            label = None
 
         X.append(features)
         y.append(label)
-        
         prices.append(price)
-        future_prices.append(future_price)
-        future_candles_list.append(future_candles)
- 
-        print("DATASET SIZE FOR WALK:", len(X))
-    
-        confidence_levels = [0.50, 0.55, 0.60, 0.65, 0.70]
-        commission = 0.001
-
-        stop_loss = 0.005
-        take_profit = 0.01
-
-        dataset_size = len(X)
-
-        windows = [
-            (int(dataset_size * 0.60), int(dataset_size * 0.70)),
-            (int(dataset_size * 0.70), int(dataset_size * 0.80)),
-            (int(dataset_size * 0.80), int(dataset_size * 0.90)),
-            (int(dataset_size * 0.90), int(dataset_size * 1.00)),
-        ]
-
-        print()
-        print("WALK FORWARD TEST")
-        print("window | train_end | test_end | conf | trades | winrate | total_return | drawdown | profit_factor | status")
-
-        walk_results = []
-
-        for index, window in enumerate(windows, start=1):
-            train_end = window[0]
-            test_end = window[1]
-
-            result = run_test_window(
-                X=X,
-                y=y,
-                prices=prices,
-                future_candles_list=future_candles_list,
-                train_end=train_end,
-                test_end=test_end,
-                confidence_levels=CONFIDENCE_LEVELS,
-                stop_loss=STOP_LOSS,
-                take_profit=TAKE_PROFIT,
-                leverage=LEVERAGE,
-                commission=COMMISSION
-            )
-
-            if result is None:
-                print(index, "|", train_end, "|", test_end, "|", "-", "|", 0, "|", 0, "|", 0, "|", 0, "|", 0, "| FAILED")
-                continue
-
-            walk_results.append(result)
-
-            print(
-                index,
-                "|",
-                train_end,
-                "|",
-                test_end,
-                "|",
-                result["confidence"],
-                "|",
-                result["trades"],
-                "|",
-                round(result["winrate"], 2),
-                "|",
-                round(result["total_return"], 2),
-                "|",
-                round(result["max_drawdown"], 2),
-                "|",
-               round(result["profit_factor"], 2),
-                "| PASSED"
-            )
-
-        passed_windows = len(walk_results)
-        total_windows = len(windows)
-
-        print()
-        print("WALK FORWARD SUMMARY")
-        print("stop_loss:", STOP_LOSS)
-        print("take_profit:", TAKE_PROFIT)
-        print("leverage:", LEVERAGE)
-        print("passed_windows:", passed_windows)
-        print("total_windows:", total_windows)
-
-        if passed_windows >= 3:
-            walk_status = "PASSED"
-        else:
-            walk_status = "FAILED"
-        print("WALK STATUS:", walk_status)
-        
-        # run_tp_sl_grid(
-        #   X=X,
-        #   y=y,
-        #   prices=prices,
-        #   future_candles_list=future_candles_list
-        # )
-
-    split_index = int(len(X) * 0.8)
-
-    X_train = X[:split_index]
-    y_train = y[:split_index]
-    X_test = X[split_index:]
-    y_test = y[split_index:]
-
-    test_prices = prices[split_index:]
-    test_future_prices = future_prices[split_index:]
-    
-    # print("CANDLES COUNT IN BACKTEST:",len(candles))
-    # print("EMA VALUES:", len(ema_values))
-    # print("RSI VALUES:", len(rsi_values))
-    # print("MOMENTUM VALUES:", len(momentum_values))
-    # print("AVG VOLUMES:",len(avg_volumes))
-    # print("VOLATILITY VALUES:", len(volatility_values))
-    # print("REGIMES:", len(regimes))
-    
-    if len(X_train) == 0 or len(y_train) == 0:
-        print("ERROR: training dataset is empty")
-        return
-
-    model = train_model(X_train, y_train)
-    show_feature_importance(model)
-    
-    wins = 0
-    losses = 0
-    returns = []
-    equity_curve = [1.0]
-
-    commission = 0.001 # 0.1% потом нужно уточнить
-    
-    confidence_levels = [0.50, 0.55, 0.60, 0.65, 0.70]
-
-    print()
-    print("CONFIDENCE TEST")
-    print("conf | trades | wins | losses | winrate | avg_return | total_return | drawdown | profit_factor")
-
-    results = []
-
-    for min_confidence in confidence_levels:
-        returns = []
-        equity_curve = [1.0]
-
-        for i in range(len(X_test)):
-            
-            probability = model.predict_proba([X_test[i]])[0]
-            
-            sell_confidence = probability[0]
-            buy_confidence = probability[1]
-
-            if buy_confidence > min_confidence:
-                prediction = 1
-            elif sell_confidence > min_confidence:
-                prediction = 0
-            else:
-                continue
-
-            entry_price = test_prices[i]
-            exit_price = test_future_prices[i]
-
-            price_return = (exit_price - entry_price) / entry_price
-
-            if prediction == 1:
-                trade_return = price_return - commission
-            else:
-                trade_return = -price_return - commission
-
-            returns.append(trade_return)
-            equity_curve.append(equity_curve[-1] * (1 + trade_return))
-    
-        total_trades = len(returns)
-        wins = sum(1 for r in returns if r > 0)
-        losses = sum(1 for r in returns if r <= 0)
-
-            
-        winrate = wins / total_trades * 100 if total_trades > 0 else 0
-
-        total_return = (equity_curve[-1] - 1) * 100
-        avg_return = sum(returns) / len(returns) * 100 if returns else 0
-
-        gross_profit = sum(r for r in returns if r > 0)
-        gross_loss = abs(sum(r for r in returns if r < 0))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
-
-        peak = equity_curve[0]
-        max_drawdown = 0
-
-        for equity in equity_curve:
-            if equity > peak:
-                peak = equity
-
-            drawdown = (peak - equity) / peak
-
-            if drawdown > max_drawdown:
-                max_drawdown = drawdown
-            
-        max_drawdown *= 100
-        
-        results.append({
-            "confidence": min_confidence,
-            "trades": total_trades,
-            "wins": wins,
-            "losses": losses,
-            "winrate": winrate,
-            "avg_return": avg_return,
-            "total_return": total_return,
-            "max_drawdown": max_drawdown,
-            "profit_factor": profit_factor
-        })
-
-        print(
-            min_confidence,
-            "|",
-            total_trades,
-            "|",
-            wins,
-            "|",
-            losses,
-            "|",
-            round(winrate, 2),
-            "|",
-            round(avg_return, 4),
-            "|",
-            round(total_return, 2),
-            "|",
-            round(max_drawdown, 2),
-            "|",
-            round(profit_factor, 2)
+        future_candles_list.append(
+            candles[i + 1:i + 1 + PREDICTION_HORIZON]
         )
 
-    valid_results = [
-        result for result in results
-        if result["trades"] >= 50
-        and result["profit_factor"] >= 1.2
-        and result["total_return"] > 0
-        and result["max_drawdown"] <= 15
-    ]
+    return X, y, prices, future_candles_list
 
-    if valid_results:
-        best_result = max(valid_results, key=lambda result: result["profit_factor"])
-        print()
-        print("CONFIDENCE TEST RESULT")
-        print("confidence:", best_result["confidence"])
-        print("trades:", best_result["trades"])
-        print("winrate:", round(best_result["winrate"]))
-        print("total_return:", round(best_result["total_return"], 2), "%")
-        print("max_drawdown:", round(best_result["max_drawdown"], 2), "%")
-        print("profit_factor:", round(best_result["profit_factor"], 2))
-        print("STATUS: PASSED")
-        best_result["symbol"] = symbol
-        best_result["status"] = "PASSED"
-        best_result["walk_status"] = walk_status
 
-        if walk_status == "PASSED" and best_result["status"] == "PASSED":
-            best_result["final_status"] = "PASSED"
-        else:
-             best_result["final_status"] = "FAILED"
+def compare_momentum(symbol="BTCUSDT"):
+    candles = get_klines(symbol=symbol, limit=1000, category="linear")
 
-        best_result["status"] = best_result["final_status"]
-        return best_result
-    else:
-        print()
-        print("CONFIDENCE TEST RESULT")
-        print("STATUS: FAILED")
-        return{
-            "symbol": symbol,
-            "status": "FAILED",
-            "walk_status": walk_status,
-            "final_status": "FAILED"
-        }
+    baseline = build_backtest_dataset(candles)
+    signed = build_backtest_dataset(
+        candles,
+        momentum_transform=lambda value, price: value / price
+    )
+
+    if baseline[1:] != signed[1:]:
+        raise RuntimeError("Experiment labels, prices or future candles differ")
+
+    print("EXPERIMENT ROWS:", len(baseline[0]))
+    print("DEVELOPMENT ROWS:", int(len(baseline[0]) * 0.8))
+
+    results = {}
+    for name, dataset in (("ABS", baseline), ("SIGNED", signed)):
+        print("\nMOMENTUM EXPERIMENT:", name)
+        results[name] = run_walk_forward(
+            *dataset,
+            stop_loss=STOP_LOSS,
+            take_profit=TAKE_PROFIT
+        )
+
+    return results
+def run_backtest(symbol="BTCUSDT"):
+    print("Running backtest for:", symbol)
+    
+    candles = get_klines(symbol=symbol, limit=1000, category="linear")
+    print("CANDLES LOADED:", len(candles))
+    
+    X, y, prices, future_candles_list = build_backtest_dataset(candles)
+
+    print("DATASET SIZE FOR WALK:", len(X))
+    print("LABELLED ROWS:", sum(label is not None for label in y))
+    print("NEUTRAL ROWS:", sum(label is None for label in y))
+    walk_result = run_walk_forward(
+        X, y, prices, future_candles_list, STOP_LOSS, TAKE_PROFIT
+    )
+    split_index = int(len(X) * 0.8)
+    holdout = run_test_window(
+        X, y, prices, future_candles_list, split_index, len(X),
+        CONFIDENCE_LEVELS, STOP_LOSS, TAKE_PROFIT, LEVERAGE, COMMISSION
+    )
+
+    print("\nCONFIDENCE VALIDATION")
+    print("conf | trades | avg_return | model_return | drawdown | PF")
+    for candidate in holdout["validation_results"]:
+        print(
+            f"{candidate['confidence']} | {candidate['trades']} | "
+            f"{candidate['avg_return']:.4f} | {candidate['total_return']:.2f} | "
+            f"{candidate['max_drawdown']:.2f} | {candidate['profit_factor']:.2f}"
+        )
+
+    holdout_passed = (
+        holdout["status"] != "SKIPPED"
+        and holdout["trades"] >= 50
+        and holdout["profit_factor"] >= 1.2
+        and holdout["total_return"] > 0
+        and holdout["max_drawdown"] <= 15
+    )
+    holdout_status = (
+        "SKIPPED" if holdout["status"] == "SKIPPED"
+        else "PASSED" if holdout_passed else "FAILED"
+    )
+    final_status = (
+        "PASSED" if walk_result["status"] == "PASSED" and holdout_passed
+        else "FAILED"
+    )
+
+    print("\nHOLDOUT TEST")
+    print("selected confidence:", holdout["confidence"])
+    print("trades:", holdout["trades"])
+    print("winrate:", round(holdout["winrate"], 2))
+    print("avg_return:", round(holdout["avg_return"], 4))
+    print("model_return:", round(holdout["total_return"], 2))
+    print("max_drawdown:", round(holdout["max_drawdown"], 2))
+    print("profit_factor:", round(holdout["profit_factor"], 2))
+    print("HOLDOUT STATUS:", holdout_status)
+    if holdout["status"] == "SKIPPED":
+        print("reason:", holdout["reason"])
+    print("FINAL STATUS:", final_status)
+
+    keys = (
+        "confidence", "trades", "wins", "losses", "winrate",
+        "avg_return", "total_return", "max_drawdown", "profit_factor"
+    )
+    result = {key: holdout[key] for key in keys}
+    result.update({
+        "symbol": symbol,
+        "status": final_status,
+        "walk_status": walk_result["status"],
+        "final_status": final_status
+    })
+    return result

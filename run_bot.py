@@ -3,6 +3,10 @@ import sys
 import time
 import csv
 import os
+from pathlib import Path
+from math import isfinite
+from imperator_monitor.run import shared_text
+from paper_report import main as print_paper_report
 from datetime import datetime
 from telegram_notify import (
     send_message,
@@ -17,13 +21,40 @@ from telegram_notify import (
 TRADES_FILE = "paper_trades.csv"
 
 
-def load_trades():
-    if not os.path.exists(TRADES_FILE):
-        return []
+def load_trades(allow_missing=False):
+    try:
+        with shared_text(TRADES_FILE) as file:
+            reader = csv.DictReader(file)
+            required = {
+                "opened_at", "symbol", "side", "status", "pnl_usdt"
+            }
 
-    with open(TRADES_FILE, "r", encoding="utf-8") as file:
-        reader = csv.DictReader(file)
-        return list(reader)
+            if not required.issubset(set(reader.fieldnames or [])):
+                raise ValueError("Invalid paper_trades.csv header")
+
+            trades = list(reader)
+
+    except FileNotFoundError:
+        if allow_missing:
+            return []
+        raise
+
+    for trade in trades:
+        if (
+            None in trade
+            or any(trade.get(key) is None for key in required)
+            or not trade["opened_at"]
+            or not trade["symbol"]
+            or trade["side"] not in {"BUY", "SELL"}
+            or trade["status"] not in {"OPEN", "CLOSED"}
+        ):
+            raise ValueError("Invalid paper_trades.csv row")
+
+        if trade["status"] == "CLOSED":
+            if not isfinite(float(trade["pnl_usdt"])):
+                raise ValueError("Invalid closed PnL in paper_trades.csv")
+
+    return trades
 
 
 def trade_id(trade):
@@ -38,8 +69,11 @@ def detect_trade_events(before_trades, after_trades):
     closed_events = []
 
     for event_id, after_trade in after_by_id.items():
-        if event_id not in before_by_id and after_trade.get("status") == "OPEN":
-            opened_events.append(after_trade)
+        if event_id not in before_by_id:
+            if after_trade.get("status") == "OPEN":
+                opened_events.append(after_trade)
+            elif after_trade.get("status") == "CLOSED":
+                closed_events.append(after_trade)
             continue
 
         if event_id in before_by_id:
@@ -52,95 +86,112 @@ def detect_trade_events(before_trades, after_trades):
 
     return opened_events, closed_events
 
-def run_script(script_name):
-    print()
-    print("=" * 50)
-    print("RUNNING:", script_name)
-    print("=" * 50)
-
-    result = subprocess.run(
-        [sys.executable, script_name],
-        text=True
-    )
-
-    if result.returncode != 0:
-        print("ERROR:", script_name, "failed")
-        return False
-
-    return True
+def notify(text):
+    try:
+        if can_send() and not send_message(text):
+            print("Telegram send failed", flush=True)
+    except Exception as error:
+        print("Telegram error:", type(error).__name__, flush=True)
 
 
 def main():
-    interval_minutes = 5
-    interval_seconds = interval_minutes * 60
+    project = Path(__file__).resolve().parent
+    os.chdir(project)
 
-    print(diagnostics())
+    scripts = {
+        "signals": project / "live.py",
+        "paper": project / "paper_trading.py",
+        "monitor": project / "imperator_monitor" / "run.py"
+    }
 
-    if can_send():
-        started_sent = send_message(
-            f"Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Cycle interval: {interval_minutes} minutes"
+    for path in scripts.values():
+        if not path.is_file():
+            raise SystemExit("Missing file: " + str(path))
+
+    previous_trades = load_trades(allow_missing=True)
+    processes = {}
+    stopped = set()
+    next_report = time.monotonic()
+
+    try:
+        for name, path in scripts.items():
+            process = subprocess.Popen(
+                [sys.executable, "-u", str(path)],
+                cwd=str(project)
+            )
+            processes[name] = process
+            print(name, "started | PID:", process.pid, flush=True)
+
+        print(diagnostics())
+        notify(
+            f"Paper bot started at {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            "Summary interval: 5 minutes"
         )
-        if not started_sent:
-            print("Telegram send failed: check token/chat_id and bot access to chat")
 
-    while True:
-        print()
-        print("=" * 50)
-        print("BOT CYCLE START")
-        print("=" * 50)
-        cycle_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        while True:
+            for name, process in processes.items():
+                code = process.poll()
 
-        if can_send():
-            cycle_started_sent = send_message(f"Cycle started: {cycle_started_at}")
-            if not cycle_started_sent:
-                print("Telegram send failed at cycle start")
+                if code is not None and name not in stopped:
+                    stopped.add(name)
+                    message = f"{name} STOPPED | exit code: {code}"
+                    print(message, flush=True)
+                    notify(message)
 
-        live_ok = run_script("live.py")
+            if len(stopped) == len(processes):
+                break
 
-        if not live_ok:
-            print("Bot cycle stopped because live.py failed")
-            if can_send():
-                    send_message("ERROR: live.py failed")
-        else:
-            trades_before = load_trades()
-            paper_ok = run_script("paper_trading.py")
+            try:
+                current_trades = load_trades()
+            except (OSError, UnicodeError, csv.Error, ValueError) as error:
+                print("Journal read failed:", str(error), flush=True)
+                time.sleep(2)
+                continue
 
-            if not paper_ok:
-                print("Bot cycle stopped because paper_trading.py failed")
-                if can_send():
-                    send_message("ERROR: paper_trading.py failed")
-            else:
-                trades_after = load_trades()
-                opened_events, closed_events = detect_trade_events(trades_before, trades_after)
+            opened, closed = detect_trade_events(
+                previous_trades, current_trades
+            )
+            previous_trades = current_trades
 
-                if can_send():
-                    for trade in opened_events:
-                        send_message(format_trade_opened(trade))
-                    for trade in closed_events:
-                        send_message(format_trade_closed(trade))
+            for trade in opened:
+                notify(format_trade_opened(trade))
 
-                report_ok = run_script("paper_report.py")
-                if not report_ok:
-                    print("Paper report failed")
-                    if can_send():
-                        send_message("ERROR: paper_report.py failed")
-                elif can_send():
-                    summary = build_trade_summary(trades_after)
-                    send_message(format_cycle_summary(summary))
+            for trade in closed:
+                notify(format_trade_closed(trade))
 
-        print()
-        print("=" * 50)
-        print("BOT CYCLE COMPLETE")
-        print("Next run in", interval_minutes, "minutes")
-        print("=" * 50)
+            if time.monotonic() >= next_report:
+                next_report = time.monotonic() + 300
 
-        if can_send():
-            cycle_complete_sent = send_message(f"Cycle complete. Next run in {interval_minutes} minutes.")
-            if not cycle_complete_sent:
-                print("Telegram send failed at cycle complete")
+                try:
+                    print_paper_report(current_trades)
+                    summary = build_trade_summary(current_trades)
+                    notify(format_cycle_summary(summary))
+                except Exception as error:
+                    print(
+                        "Report failed:",
+                        type(error).__name__,
+                        flush=True
+                    )
 
-        time.sleep(interval_seconds)
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        print("\nStopping bot...", flush=True)
+
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+
+        for process in processes.values():
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 if __name__ == "__main__":

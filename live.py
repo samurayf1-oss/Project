@@ -9,7 +9,7 @@ from features import (
     normalize_volatility,
 )
 from model import train_model
-
+from time import sleep
 
 def load_selected_symbols(filename="selected_symbols.csv"):
     symbols = []
@@ -42,11 +42,11 @@ def build_dataset(candles):
 
     start_index = 20
 
-    for i in range(start_index, len(ema_values) - 5):
+    for i in range(start_index, len(closes) - 5):
         price = closes[i]
         future_price = closes[i + 5]
 
-        current_ema = ema_values[i - 14]
+        current_ema = ema_values[i - 13]
         current_rsi = rsi_values[i - 14]
         current_momentum = momentum_values[i - 5]
         current_volume = candles[i]["volume"]
@@ -115,8 +115,11 @@ def build_current_features(candles):
     return features
 
 
-def get_live_signal(symbol, confidence):
-    candles = get_klines(symbol=symbol, limit=1000)
+def get_live_signal(symbol, confidence, candles=None):
+    if candles is None:
+        candles = get_klines(
+            symbol=symbol, interval="60", limit=1000, category="linear"
+        )
 
     X, y = build_dataset(candles)
 
@@ -144,50 +147,90 @@ def get_live_signal(symbol, confidence):
     return "HOLD", max(buy_confidence, sell_confidence), "low confidence"
 
 
-def main():
+def main(last_processed=None):
     selected_symbols = load_selected_symbols()
-
-    print()
-    print("LIVE SIGNALS")
-    print("symbol | signal | confidence | reason")
-
     signals = []
+    processed = {}
 
     for item in selected_symbols:
         symbol = item["symbol"]
         confidence = item["confidence"]
 
         try:
-            signal, signal_confidence, reason = get_live_signal(symbol, confidence)
+            if not 0.5 <= confidence <= 1:
+                raise ValueError("Confidence must be between 0.5 and 1")
 
-            print(
-                symbol,
-                "|",
-                signal,
-                "|",
-                round(signal_confidence, 4),
-                "|",
-                reason
+            candles = get_klines(
+                symbol=symbol, interval="60", limit=1000, category="linear"
+            )
+            candle_timestamp = int(candles[-1]["timestamp"])
+            candle_key = (candle_timestamp, confidence)
+
+            if (
+                last_processed is not None
+                and last_processed.get(symbol) == candle_key
+            ):
+                continue
+
+            signal, signal_confidence, reason = get_live_signal(
+                symbol, confidence, candles=candles
+            )
+
+            signal_time = datetime.fromtimestamp(
+                (candle_timestamp + 3_600_000) / 1000
             )
 
             signals.append([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                signal_time.strftime("%Y-%m-%d %H:%M:%S"),
                 symbol,
                 signal,
                 round(signal_confidence, 4),
                 reason
             ])
+            processed[symbol] = candle_key
 
         except Exception as error:
-            print(symbol, "| ERROR |", error)
+            print(
+                symbol, "| ERROR |",
+                type(error).__name__, str(error),
+                flush=True
+            )
 
-    with open("live_signals.csv", "a", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
+    if not signals:
+        return
 
-        for row in signals:
-            writer.writerow(row)
-    print()
-    print("Saved live signals to live_signals.csv")
+    with open(
+        "live_signals.csv", "a", newline="", encoding="utf-8"
+    ) as file:
+        csv.writer(file).writerows(signals)
+
+    if last_processed is not None:
+        last_processed.update(processed)
+
+    print("\nLIVE SIGNALS")
+    print("symbol | signal | confidence | reason")
+
+    for _, symbol, signal, confidence, reason in signals:
+        print(symbol, "|", signal, "|", confidence, "|", reason)
+
+    print("Saved live signals to live_signals.csv", flush=True)
 
 if __name__ == "__main__":
-    main()
+    last_processed = {}
+
+    try:
+        while True:
+            try:
+                main(last_processed)
+            except Exception as error:
+                print(
+                    "signal cycle failed:",
+                    type(error).__name__,
+                    str(error),
+                    flush=True
+                )
+
+            sleep(15)
+
+    except KeyboardInterrupt:
+        print("\nLive signals stopped.")
