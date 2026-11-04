@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Император — живой монитор</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">И</span><div><h1>ИМПЕРАТОР</h1><p>Живой монитор бумажного бота</p></div></div>
+    <div class="connection"><span class="dot" id="connection-dot"></span><span id="connection-text">Подключение к журналу…</span><span class="readonly">ТОЛЬКО НАБЛЮДЕНИЕ</span></div>
+  </header>
+
+  <main>
+    <section class="toolbar">
+      <label class="symbol-label">Инструмент<select id="symbol-select" aria-label="Инструмент"><option>BTCUSDT</option><option>ETHUSDT</option></select></label>
+      <div class="toolbar-context"><strong id="instrument-title">BTC / USDT</strong><span>Bybit · бессрочный контракт · 1 час</span></div>
+      <div class="toolbar-actions"><span id="view-badge" class="badge blue">Текущий рынок</span><button id="live-button" type="button">К текущей цене ↗</button><label class="follow-label"><input id="follow-toggle" type="checkbox" checked> Следовать за ценой</label></div>
+    </section>
+
+    <section class="metrics">
+      <article class="metric"><span>Последняя цена</span><strong id="last-price">—</strong><small id="market-age">Ожидаем котировки Bybit</small></article>
+      <article class="metric"><span>Открыто у бота · все инструменты</span><strong id="open-count">—</strong><small id="open-count-note">Чтение журнала</small></article>
+      <article class="metric"><span id="open-pnl-title">Оценка net · BTCUSDT</span><strong id="open-pnl">—</strong><small id="open-pnl-note">При закрытии по последней цене</small></article>
+      <article class="metric"><span id="closed-pnl-title">Закрытый PnL журнала · BTCUSDT</span><strong id="closed-pnl">—</strong><small id="closed-pnl-note">Записанные результаты без пересчёта</small></article>
+    </section>
+
+    <div id="messages" class="messages" role="status"></div>
+
+    <section class="workspace">
+      <div class="chart-panel panel">
+        <div class="panel-head"><div><h2>Свечи и сделки бота</h2><p id="ohlc">Наведите курсор на свечу</p></div><div class="chart-legend"><span class="legend-up">↑ BUY</span><span class="legend-down">↓ SELL</span><span>● Выход</span></div></div>
+        <div id="chart" aria-label="График свечей и сделок"></div>
+        <div class="chart-footer"><span id="candle-state">Загрузка свечей…</span><span id="marker-count">Маркеры: —</span><span>Время: UTC · события из журнала</span></div>
+      </div>
+
+      <aside>
+        <section class="panel positions-panel"><div class="panel-head"><h2>Открытые позиции</h2><span class="badge" id="positions-badge">0</span></div><div id="positions-list" class="positions-list"><p class="empty-small">Ожидаем журнал</p></div></section>
+        <section class="panel details-panel"><div class="panel-head"><h2>Выбранная сделка</h2><span id="trade-status" class="badge">—</span></div><div id="trade-details" class="details-body"><p class="empty-small">Нажми на сделку в таблице или на маркер.</p></div></section>
+        <section class="panel signal-panel"><div class="panel-head"><h2>Последний сигнал</h2><span id="signal-freshness" class="badge">—</span></div><div class="signal-body"><strong id="signal-direction">—</strong><span id="signal-confidence">Нет записи для этого инструмента</span><p id="signal-reason">Сигнал не является открытой сделкой.</p></div></section>
+      </aside>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-head table-head"><div><h2 id="table-title">Сделки · BTCUSDT</h2><p id="table-note">Автоматическое обновление каждые 2 секунды</p></div><select id="status-filter" aria-label="Фильтр сделок"><option value="ALL">Все статусы</option><option value="OPEN">Открытые</option><option value="CLOSED">Закрытые</option></select></div>
+      <div class="table-scroll"><table><thead><tr><th>№</th><th>Вход · UTC</th><th>Сторона</th><th>Статус</th><th>Цена входа</th><th>Выход / текущая</th><th>PnL · USDT</th><th>% маржи</th><th>Причина выхода</th></tr></thead><tbody id="trades-body"></tbody></table></div>
+      <div id="table-empty" class="empty-table">Загрузка журнала…</div>
+    </section>
+    <footer class="page-footer"><span id="journal-info">Журнал: paper_trades.csv</span><span>Графики: <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView Lightweight Charts™</a> · © 2025 TradingView, Inc.</span></footer>
+    <p class="footnote">Панель читает файлы проекта и публичные котировки. Запуск и торговые решения выполняет отдельно работающий бот. Исторический PnL показан как записан в журнале; у старых строк комиссии могут отсутствовать.</p>
+  </main>
+  <script src="/vendor/lightweight-charts.standalone.production.js"></script>
+  <script type="module" src="/app.mjs"></script>
+</body>
+</html>
