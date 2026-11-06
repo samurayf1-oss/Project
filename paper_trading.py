@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 from datetime import datetime, timezone
 from settings import STOP_LOSS, TAKE_PROFIT, LEVERAGE, COMMISSION
@@ -16,6 +17,8 @@ TRADING_MODE = "futures"    # "spot" или "futures"
 # STOP_LOSS_PERCENT = 0.4
 POZITION_SIZE_USDT = 100
 PAPER_INITIAL_BALANCE_USDT = 100.0
+PAPER_MAX_DRAWDOWN_PERCENT = 15.0
+PAPER_ACCOUNT_STATE_FILE = "paper_account_state.json"
 LEGACY_POSITION_SIZE_USDT = 100
 LEGACY_LEVERAGE = 3
 LEGACY_FEE_RATE = 0.0  # Прежняя бумажная модель не учитывала комиссию.
@@ -417,6 +420,82 @@ def calculate_paper_account_state(trades, open_pnl_usdt):
         "return_pct": return_pct
     }
 
+def update_paper_drawdown_state(account):
+    initial = account["initial_balance_usdt"]
+    equity = account["equity_usdt"]
+    limit = PAPER_MAX_DRAWDOWN_PERCENT
+
+    if not 0 < limit < 100:
+        raise ValueError("Invalid paper drawdown limit")
+
+    with open(PAPER_ACCOUNT_STATE_FILE, "r", encoding="utf-8-sig") as file:
+        state = json.load(file)
+
+    if (
+        not isinstance(state, dict)
+        or type(state.get("version")) is not int
+        or state["version"] != 1
+        or type(state.get("entries_blocked")) is not bool
+    ):
+        raise ValueError("Invalid paper drawdown state")
+
+    stored_initial = state.get("initial_balance_usdt")
+    peak = state.get("peak_equity_usdt")
+    max_drawdown = state.get("max_drawdown_pct")
+
+    if (
+        not all(
+            type(value) in (int, float) and isfinite(value)
+            for value in (stored_initial, peak, max_drawdown)
+        )
+        or stored_initial != initial
+        or peak < initial
+        or max_drawdown < 0
+    ):
+        raise ValueError("Invalid paper drawdown history")
+
+    peak = max(peak, equity)
+    equity_floor = peak * (1 - limit / 100)
+    drawdown = (peak - equity) / peak * 100
+
+    if not isfinite(drawdown):
+        raise ValueError("Non-finite paper drawdown")
+
+    max_drawdown = max(max_drawdown, drawdown)
+    updated = {
+        "version": 1,
+        "initial_balance_usdt": initial,
+        "peak_equity_usdt": peak,
+        "max_drawdown_pct": max_drawdown,
+        "entries_blocked": (
+            state["entries_blocked"]
+            or equity <= equity_floor
+            or max_drawdown >= limit
+        )
+    }
+
+    if updated != state:
+        directory = os.path.dirname(os.path.abspath(PAPER_ACCOUNT_STATE_FILE))
+        temp_path = None
+
+        try:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix="paper_drawdown_", suffix=".tmp", delete=False
+            ) as file:
+                temp_path = file.name
+                json.dump(updated, file, allow_nan=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+
+            os.replace(temp_path, PAPER_ACCOUNT_STATE_FILE)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    return {**updated, "drawdown_pct": drawdown, "equity_floor_usdt": equity_floor}
+
+
 def print_portfolio_summary():
     trades = load_trades()
 
@@ -452,6 +531,7 @@ def print_portfolio_summary():
 
     total_pnl = open_pnl + closed_pnl
     account = calculate_paper_account_state(trades, open_pnl_usdt)
+    drawdown = update_paper_drawdown_state(account)
     closed_pnl_usdt = account["closed_pnl_usdt"]
     total_pnl_usdt = closed_pnl_usdt + open_pnl_usdt
     
@@ -486,6 +566,10 @@ def print_portfolio_summary():
     print("used margin_usdt:", round(account["used_margin_usdt"], 4), "USDT")
     print("estimated free margin_usdt:", round(account["free_margin_usdt"], 4), "USDT")
     print("paper account return:", round(account["return_pct"], 4), "%")
+    print("peak equity_usdt:", round(drawdown["peak_equity_usdt"], 4), "USDT")
+    print("drawdown:", round(drawdown["drawdown_pct"], 4), "%")
+    print("max observed drawdown:", round(drawdown["max_drawdown_pct"], 4), "%")
+    print("drawdown entry status:", "BLOCKED" if drawdown["entries_blocked"] else "ACTIVE")
     
 def append_trade(trade):
     calculate_trade_pnl(trade, trade["entry_price"])
@@ -641,7 +725,6 @@ def manage_open_trades(trades, selected_symbols, latest_signals_map):
         symbol = trade["symbol"]
 
         try:
-            current_price = get_price(symbol)
             current_price = get_price_with_check_log(
                 trade, position_checks
             )
@@ -781,9 +864,17 @@ def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
     account = calculate_paper_account_state(
         load_trades(), get_open_pnl_usdt()
     )
+    drawdown = update_paper_drawdown_state(account)
+    if drawdown["entries_blocked"]:
+        return 0.0
+
+    drawdown_budget = (
+        account["balance_usdt"] - drawdown["equity_floor_usdt"] - open_risk
+    )
+    risk_budget = min(risk_budget, drawdown_budget)
     free_margin = account["free_margin_usdt"]
 
-    if free_margin <= 0:
+    if risk_budget <= 0 or free_margin <= 0:
         return 0.0
 
     # Reserve new margin and estimated entry/exit commissions.
