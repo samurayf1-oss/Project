@@ -5,6 +5,8 @@ from settings import (
     TAKE_PROFIT,
     LEVERAGE,
     COMMISSION,
+    MAX_HOLD_MINUTES,
+    HOLD_EXTENSION_MINUTES,
     CONFIDENCE_LEVELS,
     STOP_LOSS_GRID,
     TAKE_PROFIT_GRID
@@ -73,7 +75,8 @@ def calculate_net_trade_return(side, entry_price, exit_price, leverage, commissi
 
 def simulate_trade_with_exit(
     side, entry_price, future_candles,
-    stop_loss, take_profit, leverage, commission
+    stop_loss, take_profit, leverage, commission,
+    *, signals_at_open=(),
 ):
     if side not in {"BUY", "SELL"} or not future_candles:
         raise ValueError("Valid side and non-empty future candles required")
@@ -92,8 +95,11 @@ def simulate_trade_with_exit(
 
     stop_price = entry_price * (1 - stop_loss if side == "BUY" else 1 + stop_loss)
     take_price = entry_price * (1 + take_profit if side == "BUY" else 1 - take_profit)
+    lower_exit_price = min(stop_price, take_price)
+    upper_exit_price = max(stop_price, take_price)
 
     for bars_held, candle in enumerate(future_candles, start=1):
+        open_price = float(candle["open"]) if "open" in candle else None
         high = float(candle["high"])
         low = float(candle["low"])
         close = float(candle["close"])
@@ -102,12 +108,26 @@ def simulate_trade_with_exit(
             not all(isfinite(value) for value in (high, low, close))
             or low <= 0
             or not low <= close <= high
+            or (open_price is not None and not low <= open_price <= high)
         ):
             raise ValueError("Invalid future candle")
 
+        signal_at_open = (
+            signals_at_open[bars_held - 1]
+            if bars_held <= len(signals_at_open)
+            else "HOLD"
+        )
+        opposite_signal = signal_at_open in {"BUY", "SELL"} and signal_at_open != side
+
         exit_price = None
 
-        if side == "BUY":
+        if open_price is not None and (
+            opposite_signal
+            or open_price <= lower_exit_price
+            or open_price >= upper_exit_price
+        ):
+            exit_price = open_price
+        elif side == "BUY":
             if low <= stop_price:
                 exit_price = stop_price
             elif high >= take_price:
@@ -123,7 +143,23 @@ def simulate_trade_with_exit(
                 side, entry_price, exit_price, leverage, commission
             )
             return net_return, bars_held
+        
+        candle_minutes = 60
+        minutes_held = bars_held * candle_minutes
+        first_time_check = (
+            minutes_held - candle_minutes < MAX_HOLD_MINUTES <= minutes_held
+        )
+        hard_limit_reached = (
+            minutes_held >= MAX_HOLD_MINUTES + HOLD_EXTENSION_MINUTES
+        )
 
+        if first_time_check or hard_limit_reached:
+            net_return = calculate_net_trade_return(
+                side, entry_price, close, leverage, commission
+            )
+            if hard_limit_reached or net_return > 0:
+                return net_return, bars_held
+            
     net_return = calculate_net_trade_return(
         side, entry_price, future_candles[-1]["close"], leverage, commission
     )
@@ -211,30 +247,45 @@ def run_test_window(
         raise ValueError("Confidence must be in [0.5, 1)")
 
     def evaluate(model, confidence, start, end):
-        returns = []
-        index = start
+        signal_end = end + PREDICTION_HORIZON
+        signals = []
 
-        while index < end:
-            sell, buy = map(float, model.predict_proba([X[index]])[0])
+        for probabilities in model.predict_proba(X[start:signal_end]):
+            sell, buy = map(float, probabilities)
             if (
                 not all(isfinite(value) and 0 <= value <= 1 for value in (sell, buy))
                 or abs(sell + buy - 1) > 1e-6
             ):
                 raise ValueError("Invalid model probabilities")
 
-            if buy > confidence:
-                side = "BUY"
-            elif sell > confidence:
-                side = "SELL"
+            if buy >= confidence:
+                signals.append("BUY")
+            elif sell >= confidence:
+                signals.append("SELL")
             else:
+                signals.append("HOLD")
+
+        returns = []
+        index = start
+
+        while index < end:
+            signal_index = index - start
+            side = signals[signal_index]
+            if side == "HOLD":
                 index += 1
                 continue
+
+            future_candles = future_candles_list[index]
+            entry_price = prices[index]
+            if future_candles:
+                entry_price = future_candles[0].get("open", entry_price)
+
             trade_return, bars_held = simulate_trade_with_exit(
-                side, prices[index], future_candles_list[index],
-                stop_loss, take_profit, leverage, commission
+                side, entry_price, future_candles,
+                stop_loss, take_profit, leverage, commission,
+                signals_at_open=signals[signal_index:signal_index + PREDICTION_HORIZON],
             )
             returns.append(trade_return)
-
             index += bars_held + 1
 
         result = summarize_returns(returns)
@@ -500,10 +551,16 @@ def compare_momentum(symbol="BTCUSDT"):
         )
 
     return results
-def run_backtest(symbol="BTCUSDT"):
+def run_backtest(symbol="BTCUSDT", *, candles=None):
+    """Run the backtest with validated H1 candles when supplied."""
     print("Running backtest for:", symbol)
-    
-    candles = get_klines(symbol=symbol, limit=1000, category="linear")
+
+    if candles is None:
+        candles = get_klines(symbol=symbol, limit=1000, category="linear")
+
+    if not candles:
+        raise ValueError("Backtest requires closed candles")
+
     print("CANDLES LOADED:", len(candles))
     
     X, y, prices, future_candles_list = build_backtest_dataset(candles)

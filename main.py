@@ -1,4 +1,7 @@
 import csv
+import os
+from tempfile import NamedTemporaryFile
+
 from backtest import run_backtest
 
 symbols = [
@@ -75,41 +78,55 @@ print("FAILED SYMBOLS:")
 for symbol in failed_symbols:
     print(symbol)
 
-with open("selected_symbols.csv", "w", newline="", encoding="utf-8") as file:
-    writer = csv.writer(file)
+selection_path = os.path.abspath("selected_symbols.csv")
+temp_path = None
 
-    writer.writerow([
-        "symbol",
-        "status",
-        "confidence",
-        "trades",
-        "winrate",
-        "total_return",
-        "max_drawdown",
-        "profit_factor"
-    ])
+try:
+    with NamedTemporaryFile(
+        mode="w",
+        newline="",
+        encoding="utf-8",
+        dir=os.path.dirname(selection_path),
+        prefix="selected_symbols_",
+        suffix=".tmp",
+        delete=False,
+    ) as file:
+        temp_path = file.name
+        writer = csv.writer(file)
 
-    for result in passed_symbols:
         writer.writerow([
-            result["symbol"],
-        result["status"],
-        result["confidence"],
-        result["trades"],
-        round(result["winrate"], 2),
-        round(result["total_return"], 2),        
-        round(result["max_drawdown"], 2),
-        round(result["profit_factor"], 2)
+            "symbol",
+            "status",
+            "confidence",
+            "trades",
+            "winrate",
+            "total_return",
+            "max_drawdown",
+            "profit_factor",
         ])
-    for symbol in failed_symbols:
-        writer.writerow([
-            symbol,
-            "FAILED",
-            "",
-            "",
-            "",
-            "",
-            "",
-            ""
-        ])
+
+        for result in passed_symbols:
+            writer.writerow([
+                result["symbol"],
+                result["status"],
+                result["confidence"],
+                result["trades"],
+                round(result["winrate"], 2),
+                round(result["total_return"], 2),
+                round(result["max_drawdown"], 2),
+                round(result["profit_factor"], 2),
+            ])
+
+        for symbol in failed_symbols:
+            writer.writerow([symbol, "FAILED", "", "", "", "", "", ""])
+
+        file.flush()
+        os.fsync(file.fileno())
+
+    os.replace(temp_path, selection_path)
+finally:
+    if temp_path is not None and os.path.exists(temp_path):
+        os.remove(temp_path)
+
 print()
 print("Saved selection to selected_symbols.csv")

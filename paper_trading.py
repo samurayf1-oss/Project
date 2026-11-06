@@ -279,7 +279,7 @@ def get_trade_hold_limit_minutes(trade):
 
     try:
         return int(float(value))
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return MAX_HOLD_MINUTES
 
 def close_trade(trade, exit_price, reason):
@@ -421,12 +421,16 @@ def calculate_paper_account_state(trades, open_pnl_usdt):
     }
 
 def update_paper_drawdown_state(account):
-    initial = account["initial_balance_usdt"]
-    equity = account["equity_usdt"]
-    limit = PAPER_MAX_DRAWDOWN_PERCENT
+    initial = float(account["initial_balance_usdt"])
+    equity = float(account["equity_usdt"])
+    limit = float(PAPER_MAX_DRAWDOWN_PERCENT)
 
-    if not 0 < limit < 100:
-        raise ValueError("Invalid paper drawdown limit")
+    if (
+        not all(isfinite(value) for value in (initial, equity, limit))
+        or initial <= 0
+        or not 0 < limit < 100
+    ):
+        raise ValueError("Invalid paper equity or drawdown limit")
 
     with open(PAPER_ACCOUNT_STATE_FILE, "r", encoding="utf-8-sig") as file:
         state = json.load(file)
@@ -439,15 +443,17 @@ def update_paper_drawdown_state(account):
     ):
         raise ValueError("Invalid paper drawdown state")
 
-    stored_initial = state.get("initial_balance_usdt")
-    peak = state.get("peak_equity_usdt")
-    max_drawdown = state.get("max_drawdown_pct")
+    values = (
+        state["initial_balance_usdt"],
+        state["peak_equity_usdt"],
+        state["max_drawdown_pct"]
+    )
+    if any(isinstance(value, bool) for value in values):
+        raise ValueError("Invalid numeric drawdown state")
 
+    stored_initial, peak, max_drawdown = map(float, values)
     if (
-        not all(
-            type(value) in (int, float) and isfinite(value)
-            for value in (stored_initial, peak, max_drawdown)
-        )
+        not all(isfinite(value) for value in (stored_initial, peak, max_drawdown))
         or stored_initial != initial
         or peak < initial
         or max_drawdown < 0
@@ -456,13 +462,13 @@ def update_paper_drawdown_state(account):
 
     peak = max(peak, equity)
     equity_floor = peak * (1 - limit / 100)
-    drawdown = (peak - equity) / peak * 100
+    drawdown = max(0.0, (peak - equity) / peak * 100)
 
-    if not isfinite(drawdown):
-        raise ValueError("Non-finite paper drawdown")
+    if not all(isfinite(value) for value in (equity_floor, drawdown)):
+        raise ValueError("Non-finite drawdown calculation")
 
     max_drawdown = max(max_drawdown, drawdown)
-    updated = {
+    state = {
         "version": 1,
         "initial_balance_usdt": initial,
         "peak_equity_usdt": peak,
@@ -474,27 +480,31 @@ def update_paper_drawdown_state(account):
         )
     }
 
-    if updated != state:
-        directory = os.path.dirname(os.path.abspath(PAPER_ACCOUNT_STATE_FILE))
-        temp_path = None
+    directory = os.path.dirname(os.path.abspath(PAPER_ACCOUNT_STATE_FILE))
+    temp_path = None
 
-        try:
-            with NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=directory,
-                prefix="paper_drawdown_", suffix=".tmp", delete=False
-            ) as file:
-                temp_path = file.name
-                json.dump(updated, file, allow_nan=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix="paper_drawdown_", suffix=".tmp", delete=False
+        ) as file:
+            temp_path = file.name
+            json.dump(state, file, ensure_ascii=False, allow_nan=False, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
 
-            os.replace(temp_path, PAPER_ACCOUNT_STATE_FILE)
-        finally:
-            if temp_path is not None and os.path.exists(temp_path):
-                os.remove(temp_path)
+        os.replace(temp_path, PAPER_ACCOUNT_STATE_FILE)
 
-    return {**updated, "drawdown_pct": drawdown, "equity_floor_usdt": equity_floor}
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.remove(temp_path)
 
+    return {
+        **state,
+        "drawdown_pct": drawdown,
+        "equity_floor_usdt": equity_floor
+    }
 
 def print_portfolio_summary():
     trades = load_trades()
@@ -569,7 +579,11 @@ def print_portfolio_summary():
     print("peak equity_usdt:", round(drawdown["peak_equity_usdt"], 4), "USDT")
     print("drawdown:", round(drawdown["drawdown_pct"], 4), "%")
     print("max observed drawdown:", round(drawdown["max_drawdown_pct"], 4), "%")
-    print("drawdown entry status:", "BLOCKED" if drawdown["entries_blocked"] else "ACTIVE")
+    print("drawdown limit:", PAPER_MAX_DRAWDOWN_PERCENT, "%")
+    print(
+        "drawdown entry status:",
+        "BLOCKED" if drawdown["entries_blocked"] else "ACTIVE"
+    )
     
 def append_trade(trade):
     calculate_trade_pnl(trade, trade["entry_price"])
@@ -774,17 +788,23 @@ def manage_open_trades(trades, selected_symbols, latest_signals_map):
             continue
 
         hold_limit_minutes = get_trade_hold_limit_minutes(trade)
+        hard_hold_limit_minutes = MAX_HOLD_MINUTES + HOLD_EXTENSION_MINUTES
+
+        if trade_age_minutes >= hard_hold_limit_minutes:
+            close_trade(trade, current_price, "MAX_HOLD_TIME")
+            print(symbol, "| manage | closed by maximum hold time |", current_price)
+            continue
+
         if trade_age_minutes >= hold_limit_minutes:
             if current_pnl_usdt > 0:
                 close_trade(trade, current_price, "TIME_EXIT_IN_PROFIT")
                 print(symbol, "| manage | closed by time (profit) |", current_price)
             else:
-                new_hold_limit = hold_limit_minutes + HOLD_EXTENSION_MINUTES
-                trade["max_hold_minutes"] = str(new_hold_limit)
+                trade["max_hold_minutes"] = str(hard_hold_limit_minutes)
                 print(
                     symbol,
-                    "| manage | extended hold by 180m (loss), new limit:",
-                    f"{new_hold_limit}m"
+                    "| manage | extended hold, total limit:",
+                    f"{hard_hold_limit_minutes}m"
                 )
 
     save_all_trades(trades)
@@ -865,6 +885,7 @@ def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
         load_trades(), get_open_pnl_usdt()
     )
     drawdown = update_paper_drawdown_state(account)
+
     if drawdown["entries_blocked"]:
         return 0.0
 
@@ -877,7 +898,6 @@ def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
     if risk_budget <= 0 or free_margin <= 0:
         return 0.0
 
-    # Reserve new margin and estimated entry/exit commissions.
     capital_margin_limit = free_margin / (1 + 2 * leverage * fee_rate)
 
     margin = min(
@@ -889,8 +909,19 @@ def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
     return floor(margin * 100) / 100
 
 def main():
-    latest_signals = load_latest_signals()
-    selected_symbols = load_selected_symbols()
+    try:
+        latest_signals = load_latest_signals()
+        selected_symbols = load_selected_symbols()
+    except (OSError, csv.Error, KeyError, ValueError) as error:
+        print(
+            "Signal input unavailable | new entries blocked |",
+            type(error).__name__,
+            error,
+            flush=True,
+        )
+        latest_signals = []
+        selected_symbols = []
+    
 
     if not selected_symbols:
         print("No selected symbols for new paper trades.")
