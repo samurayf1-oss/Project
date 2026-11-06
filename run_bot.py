@@ -2,10 +2,11 @@ import subprocess
 import sys
 import time
 import csv
+import json
 import os
 from pathlib import Path
 from math import isfinite
-from imperator_monitor.run import shared_text
+from imperator_monitor.run import finite_number, shared_text
 from paper_report import main as print_paper_report
 from datetime import datetime
 from telegram_notify import (
@@ -17,7 +18,9 @@ from telegram_notify import (
     format_cycle_summary,
     build_trade_summary,
 )
-
+from process_lock import exclusive_file_lock
+from imperator_monitor.run import finite_number, shared_text
+from uuid import uuid4
 TRADES_FILE = "paper_trades.csv"
 
 
@@ -93,7 +96,23 @@ def notify(text):
     except Exception as error:
         print("Telegram error:", type(error).__name__, flush=True)
 
+def paper_cycle_ready(project, run_id, started_at):
+    try:
+        with shared_text(project / "paper_status.json") as file:
+            state = json.load(file)
+    except (OSError, ValueError):
+        return False
 
+    if (
+        not run_id
+        or not isinstance(state, dict)
+        or state.get("status") != "OK"
+        or state.get("run_id") != run_id
+    ):
+        return False
+
+    updated_at = finite_number(state.get("updated_at"), positive=True)
+    return updated_at is not None and started_at <= updated_at <= time.time()
 def main():
     project = Path(__file__).resolve().parent
     os.chdir(project)
@@ -112,33 +131,74 @@ def main():
     processes = {}
     stopped = set()
     next_report = time.monotonic()
+    paper_started_at = 0.0
+    paper_run_id = None
+    paper_ready = False
+    paper_restart_at = None
+    paper_restart_used = False
+
+    def start_process(name):
+        nonlocal paper_started_at, paper_run_id
+        env = None
+
+        if name == "paper":
+            paper_started_at = time.time()
+            paper_run_id = uuid4().hex
+            env = os.environ.copy()
+            env["IMPERATOR_PAPER_RUN_ID"] = paper_run_id
+
+        return subprocess.Popen(
+            [sys.executable, "-u", str(scripts[name])],
+            cwd=str(project),
+            env=env,
+        )
 
     try:
-        for name, path in scripts.items():
-            process = subprocess.Popen(
-                [sys.executable, "-u", str(path)],
-                cwd=str(project)
-            )
+        for name in scripts:
+            process = start_process(name)
             processes[name] = process
             print(name, "started | PID:", process.pid, flush=True)
 
-        print(diagnostics())
-        notify(
-            f"Paper bot started at {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            "Summary interval: 5 minutes"
-        )
 
         while True:
+            if not paper_restart_used and not paper_ready and "paper" not in stopped:
+                paper_ready = paper_cycle_ready(project, paper_run_id, paper_started_at)
+                if paper_ready:
+                    print("paper ready | run_id:", paper_run_id, flush=True)
+                    notify(
+                        f"Paper first cycle completed at {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                        "Summary interval: 5 minutes"
+                    )
+
             for name, process in processes.items():
                 code = process.poll()
-
                 if code is not None and name not in stopped:
                     stopped.add(name)
                     message = f"{name} STOPPED | exit code: {code}"
                     print(message, flush=True)
                     notify(message)
 
-            if len(stopped) == len(processes):
+                    if (
+                        name == "paper"
+                        and code != 0
+                        and paper_ready
+                        and not paper_restart_used
+                    ):
+                        paper_restart_used = True
+                        paper_restart_at = time.monotonic() + 5
+                        print("paper restart scheduled | delay: 5s", flush=True)
+
+            if paper_restart_at is not None and time.monotonic() >= paper_restart_at:
+                paper_restart_at = None
+                try:
+                    processes["paper"] = start_process("paper")
+                except OSError as error:
+                    print("paper restart failed:", type(error).__name__, str(error), flush=True)
+                else:
+                    stopped.discard("paper")
+                    print("paper restarted | PID:", processes["paper"].pid, flush=True)
+
+            if len(stopped) == len(processes) and paper_restart_at is None:
                 break
 
             try:
@@ -195,4 +255,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with exclusive_file_lock(Path(__file__).resolve(), "Bot supervisor"):
+        main()

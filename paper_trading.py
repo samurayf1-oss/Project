@@ -1,12 +1,23 @@
+from contextlib import contextmanager
 import csv
 import json
 import os
 from datetime import datetime, timezone
-from settings import STOP_LOSS, TAKE_PROFIT, LEVERAGE, COMMISSION
+from settings import (
+    STOP_LOSS,
+    TAKE_PROFIT,
+    LEVERAGE,
+    COMMISSION,
+    MAX_HOLD_MINUTES,
+    HOLD_EXTENSION_MINUTES,
+)
 from data import get_price, get_entry_price
 from math import floor, isfinite
 from tempfile import NamedTemporaryFile
 from time import sleep, monotonic
+from process_lock import exclusive_file_lock
+from argparse import ArgumentParser
+from time import sleep, monotonic, time
 
 SELECTED_SYMBOLS_FILE = "selected_symbols.csv"
 SIGNALS_FILE = "live_signals.csv"
@@ -33,9 +44,7 @@ MIN_ENTRY_TURNOVER_24H_USDT = 10_000_000.0
 
 MAX_OPEN_TRADES = 3
 MAXDAILY_LOSS_USDT = -3
-MAX_HOLD_MINUTES = 60
 MAX_SIGNAL_AGE_MINUTES = 10
-HOLD_EXTENSION_MINUTES = 180
 REENTRY_COOLDOWN_MINUTES = 15
 
 def load_latest_signals():
@@ -816,10 +825,18 @@ def manage_open_trades(trades, selected_symbols, latest_signals_map):
             + ", ".join(sorted(failed_symbols))
         )
     
-def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
-    leverage = float(LEVERAGE)
-    stop_loss = float(STOP_LOSS)
-    fee_rate = float(COMMISSION)
+def calculate_position_size_usdt(
+    open_trades,
+    today_closed_pnl_usdt,
+    *,
+    sizing_state=None,
+    leverage=None,
+    stop_loss=None,
+    fee_rate=None,
+):
+    leverage = float(LEVERAGE if leverage is None else leverage)
+    stop_loss = float(STOP_LOSS if stop_loss is None else stop_loss)
+    fee_rate = float(COMMISSION if fee_rate is None else fee_rate)
     max_margin = float(POZITION_SIZE_USDT)
     per_trade_risk = float(MAX_RISK_PER_TRADE_USDT)
     max_open_risk = float(MAX_TOTAL_OPEN_RISK_USDT)
@@ -881,19 +898,35 @@ def calculate_position_size_usdt(open_trades, today_closed_pnl_usdt):
 
     loss_per_margin = leverage * (stop_loss + fee_rate * (2 + stop_loss))
 
-    account = calculate_paper_account_state(
-        load_trades(), get_open_pnl_usdt()
-    )
-    drawdown = update_paper_drawdown_state(account)
+    if sizing_state is None:
+        account = calculate_paper_account_state(
+            load_trades(), get_open_pnl_usdt()
+        )
+        drawdown = update_paper_drawdown_state(account)
+        sizing_state = {
+            "balance_usdt": account["balance_usdt"],
+            "free_margin_usdt": account["free_margin_usdt"],
+            "equity_floor_usdt": drawdown["equity_floor_usdt"],
+            "entries_blocked": drawdown["entries_blocked"],
+        }
 
-    if drawdown["entries_blocked"]:
+    balance = float(sizing_state["balance_usdt"])
+    free_margin = float(sizing_state["free_margin_usdt"])
+    equity_floor = float(sizing_state["equity_floor_usdt"])
+    entries_blocked = sizing_state["entries_blocked"]
+
+    if (
+        type(entries_blocked) is not bool
+        or not all(isfinite(value) for value in (balance, free_margin, equity_floor))
+        or equity_floor <= 0
+    ):
+        raise ValueError("Invalid position sizing state")
+
+    if entries_blocked:
         return 0.0
 
-    drawdown_budget = (
-        account["balance_usdt"] - drawdown["equity_floor_usdt"] - open_risk
-    )
+    drawdown_budget = balance - equity_floor - open_risk
     risk_budget = min(risk_budget, drawdown_budget)
-    free_margin = account["free_margin_usdt"]
 
     if risk_budget <= 0 or free_margin <= 0:
         return 0.0
@@ -1127,26 +1160,132 @@ def main():
     print_portfolio_summary()
     
 
-if __name__ == "__main__":
+def _paper_writer_lock():
+    return exclusive_file_lock(TRADES_FILE, "Paper writer")
+
+def _initialize_paper_account():
+    state_path = os.path.abspath(PAPER_ACCOUNT_STATE_FILE)
+    if os.path.lexists(state_path):
+        raise SystemExit(f"Paper account state already exists: {state_path}")
+    if os.path.lexists(TRADES_FILE):
+        raise SystemExit("Paper journal already exists. Restore its account state from backup.")
+
+    initial = float(PAPER_INITIAL_BALANCE_USDT)
+    if not isfinite(initial) or initial <= 0:
+        raise ValueError("Invalid paper initial balance")
+
+    state = {
+        "version": 1,
+        "initial_balance_usdt": initial,
+        "peak_equity_usdt": initial,
+        "max_drawdown_pct": 0.0,
+        "entries_blocked": False,
+    }
+    temp_path = None
     try:
-        while True:
-            print(
-                "\nPAPER CYCLE",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                flush=True
-            )
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8",
+            dir=os.path.dirname(state_path),
+            prefix="paper_init_", suffix=".tmp", delete=False,
+        ) as file:
+            temp_path = file.name
+            json.dump(state, file, allow_nan=False, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+        if os.name == "nt":
+            os.rename(temp_path, state_path)
+        else:
+            os.link(temp_path, state_path)
+    except FileExistsError:
+        raise SystemExit(f"Paper account state already exists: {state_path}") from None
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    print("Initialized paper account state:", state_path)
+
+def _write_paper_status(status, error_type=""):
+    directory = os.path.dirname(os.path.abspath(TRADES_FILE))
+    status_path = os.path.join(directory, "paper_status.json")
+    temp_path = None
+    try:
+        try:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix="paper_status_", suffix=".tmp", delete=False,
+            ) as file:
+                temp_path = file.name
+                json.dump(
+                    {
+                        "status": status,
+                        "updated_at": time(),
+                        "error_type": error_type,
+                        "pid": os.getpid(),
+                        "run_id": os.environ.get("IMPERATOR_PAPER_RUN_ID"),
+                    },
+                    file,
+                    allow_nan=False,
+                )
+            os.replace(temp_path, status_path)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
+    except OSError as error:
+        print("paper status write failed:", type(error).__name__, flush=True)
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--init-account",
+        action="store_true",
+        help="Initialize an account in a fresh paper directory",
+    )
+    args = parser.parse_args()
+
+    try:
+        with _paper_writer_lock():
+            if args.init_account:
+                _initialize_paper_account()
+                raise SystemExit(0)
 
             try:
-                main()
-            except Exception as error:
-                print(
-                    "paper cycle failed:",
-                    type(error).__name__,
-                    str(error),
-                    flush=True
-                )
+                _write_paper_status("STARTING")
 
-            sleep(PAPER_CHECK_INTERVAL_SECONDS)
+                if not os.path.lexists(PAPER_ACCOUNT_STATE_FILE):
+                    if not os.path.lexists(TRADES_FILE):
+                        raise SystemExit(
+                            "Paper account is uninitialized. Run python paper_trading.py --init-account."
+                        )
+                    print(
+                        "Paper account state is missing. Restore it before opening new positions.",
+                        flush=True,
+                    )
+
+                while True:
+                    print(
+                        "\nPAPER CYCLE",
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        flush=True
+                    )
+
+                    try:
+                        main()
+                    except Exception as error:
+                        print(
+                            "paper cycle failed:",
+                            type(error).__name__,
+                            str(error),
+                            flush=True
+                        )
+                        _write_paper_status("ERROR", type(error).__name__)
+                    else:
+                        _write_paper_status("OK")
+
+                    sleep(PAPER_CHECK_INTERVAL_SECONDS)
+            finally:
+                _write_paper_status("STOPPED")
 
     except KeyboardInterrupt:
         print("\nPaper trading stopped.")

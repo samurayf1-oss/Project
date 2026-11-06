@@ -6,3 +6,6 @@ signals_log.csv
 selected_symbols.csv
 live_signals.csv
 paper_trades.csv
+paper_trades.csv.look
+paper_status.json
+live_signals.csv.lock

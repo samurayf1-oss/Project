@@ -1,3 +1,5 @@
+from datetime import date
+import paper_trading as paper
 from data import get_klines
 from indicators import ema, rsi, momentum, average_volume, volatility, market_regime
 from settings import (
@@ -73,7 +75,7 @@ def calculate_net_trade_return(side, entry_price, exit_price, leverage, commissi
     return net_return
 
 
-def simulate_trade_with_exit(
+def _simulate_trade_execution(
     side, entry_price, future_candles,
     stop_loss, take_profit, leverage, commission,
     *, signals_at_open=(),
@@ -120,6 +122,7 @@ def simulate_trade_with_exit(
         opposite_signal = signal_at_open in {"BUY", "SELL"} and signal_at_open != side
 
         exit_price = None
+        exit_phase = "INTRABAR"
 
         if open_price is not None and (
             opposite_signal
@@ -127,6 +130,7 @@ def simulate_trade_with_exit(
             or open_price >= upper_exit_price
         ):
             exit_price = open_price
+            exit_phase = "OPEN"
         elif side == "BUY":
             if low <= stop_price:
                 exit_price = stop_price
@@ -142,8 +146,8 @@ def simulate_trade_with_exit(
             net_return = calculate_net_trade_return(
                 side, entry_price, exit_price, leverage, commission
             )
-            return net_return, bars_held
-        
+            break
+
         candle_minutes = 60
         minutes_held = bars_held * candle_minutes
         first_time_check = (
@@ -158,12 +162,39 @@ def simulate_trade_with_exit(
                 side, entry_price, close, leverage, commission
             )
             if hard_limit_reached or net_return > 0:
-                return net_return, bars_held
-            
-    net_return = calculate_net_trade_return(
-        side, entry_price, future_candles[-1]["close"], leverage, commission
+                exit_price = close
+                exit_phase = "CLOSE"
+                break
+    else:
+        exit_price = close
+        exit_phase = "CLOSE"
+        net_return = calculate_net_trade_return(
+            side, entry_price, exit_price, leverage, commission
+        )
+
+    return {
+        "side": side,
+        "entry_time_ms": future_candles[0].get("timestamp"),
+        "entry_price": entry_price,
+        "exit_bar_start_ms": future_candles[bars_held - 1].get("timestamp"),
+        "exit_price": exit_price,
+        "exit_phase": exit_phase,
+        "bars_held": bars_held,
+        "net_return": net_return,
+    }
+
+
+def simulate_trade_with_exit(
+    side, entry_price, future_candles,
+    stop_loss, take_profit, leverage, commission,
+    *, signals_at_open=(),
+):
+    execution = _simulate_trade_execution(
+        side, entry_price, future_candles,
+        stop_loss, take_profit, leverage, commission,
+        signals_at_open=signals_at_open,
     )
-    return net_return, len(future_candles)
+    return execution["net_return"], execution["bars_held"]
 
 
 def simulate_trade(
@@ -211,9 +242,108 @@ def summarize_returns(returns):
         "profit_factor": profit_factor,
         "returns": returns
     }
+class _PaperAccountReplay:
+    def __init__(self, stop_loss, leverage, commission):
+        self.initial_balance = float(paper.PAPER_INITIAL_BALANCE_USDT)
+        self.drawdown_limit = float(paper.PAPER_MAX_DRAWDOWN_PERCENT)
+        if (
+            not isfinite(self.initial_balance)
+            or self.initial_balance <= 0
+            or not 0 < self.drawdown_limit < 100
+        ):
+            raise ValueError("Invalid paper account limits")
+
+        self.balance = self.peak_equity = self.initial_balance
+        self.max_drawdown_pct = 0.0
+        self.entries_blocked = False
+        self.daily_pnl = {}
+        self.trades = 0
+        self.skipped_signals = 0
+        self.stop_loss = stop_loss
+        self.leverage = leverage
+        self.commission = commission
+
+    @staticmethod
+    def _day(timestamp_ms, *, at_close=False):
+        if type(timestamp_ms) is not int or timestamp_ms <= 0:
+            raise ValueError("Paper replay requires candle timestamps in milliseconds")
+        if at_close:
+            timestamp_ms += 3_600_000
+        return date.fromtimestamp(timestamp_ms / 1000)
+
+    def _equity_floor(self):
+        return self.peak_equity * (1 - self.drawdown_limit / 100)
+
+    def _observe_equity(self, equity):
+        if not isfinite(equity):
+            raise ValueError("Non-finite replay equity")
+        self.peak_equity = max(self.peak_equity, equity)
+        drawdown = (self.peak_equity - equity) / self.peak_equity * 100
+        if not isfinite(drawdown):
+            raise ValueError("Non-finite replay drawdown")
+        self.max_drawdown_pct = max(self.max_drawdown_pct, drawdown)
+        self.entries_blocked = (
+            self.entries_blocked
+            or equity <= self._equity_floor()
+            or self.max_drawdown_pct >= self.drawdown_limit
+        )
+
+    def position_size_usdt(self, timestamp_ms):
+        daily_pnl = self.daily_pnl.get(self._day(timestamp_ms), 0.0)
+        margin = paper.calculate_position_size_usdt(
+            [],
+            daily_pnl,
+            sizing_state={
+                "balance_usdt": self.balance,
+                "free_margin_usdt": self.balance,
+                "equity_floor_usdt": self._equity_floor(),
+                "entries_blocked": self.entries_blocked,
+            },
+            leverage=self.leverage,
+            stop_loss=self.stop_loss,
+            fee_rate=self.commission,
+        )
+        if margin <= 0:
+            self.skipped_signals += 1
+        return margin
+
+    def record_trade(self, execution, future_candles, margin):
+        exit_day = self._day(
+            execution["exit_bar_start_ms"],
+            at_close=execution["exit_phase"] == "CLOSE",
+        )
+        entry_price = execution["entry_price"]
+        mark_prices = [entry_price]
+        mark_prices.extend(
+            candle["close"] for candle in future_candles[:execution["bars_held"] - 1]
+        )
+        for mark_price in mark_prices:
+            net_return = calculate_net_trade_return(
+                execution["side"], entry_price, mark_price, self.leverage, self.commission
+            )
+            self._observe_equity(self.balance + margin * net_return)
+
+        pnl_usdt = round(margin * execution["net_return"], 8)
+        self.balance += pnl_usdt
+        self.daily_pnl[exit_day] = self.daily_pnl.get(exit_day, 0.0) + pnl_usdt
+        self._observe_equity(self.balance)
+        self.trades += 1
+
+    def summary(self):
+        return {
+            "initial_balance_usdt": self.initial_balance,
+            "balance_usdt": self.balance,
+            "pnl_usdt": self.balance - self.initial_balance,
+            "peak_equity_usdt": self.peak_equity,
+            "max_drawdown_pct": self.max_drawdown_pct,
+            "entries_blocked": self.entries_blocked,
+            "trades": self.trades,
+            "skipped_signals": self.skipped_signals,
+        }
 def run_test_window(
     X, y, prices, future_candles_list, train_end, test_end,
-    confidence_levels, stop_loss, take_profit, leverage, commission
+    confidence_levels, stop_loss, take_profit, leverage, commission,
+    *, replay_account=False,
 ):
     if not len(X) == len(y) == len(prices) == len(future_candles_list):
         raise ValueError("Dataset columns must have equal lengths")
@@ -226,6 +356,7 @@ def run_test_window(
             "confidence": None,
             "status": "SKIPPED",
             "reason": reason,
+            "executions": [],
             "validation_results": validation_results or []
         })
         return result
@@ -246,7 +377,7 @@ def run_test_window(
     if any(not isfinite(value) or not 0.5 <= value < 1 for value in thresholds):
         raise ValueError("Confidence must be in [0.5, 1)")
 
-    def evaluate(model, confidence, start, end):
+    def evaluate(model, confidence, start, end, *, account=None):
         signal_end = end + PREDICTION_HORIZON
         signals = []
 
@@ -265,7 +396,7 @@ def run_test_window(
             else:
                 signals.append("HOLD")
 
-        returns = []
+        executions = []
         index = start
 
         while index < end:
@@ -280,17 +411,35 @@ def run_test_window(
             if future_candles:
                 entry_price = future_candles[0].get("open", entry_price)
 
-            trade_return, bars_held = simulate_trade_with_exit(
+            if account is not None:
+                if not future_candles:
+                    raise ValueError("Paper replay requires future candles")
+                margin = account.position_size_usdt(future_candles[0].get("timestamp"))
+                if margin <= 0:
+                    index += 1
+                    continue
+
+            execution = _simulate_trade_execution(
                 side, entry_price, future_candles,
                 stop_loss, take_profit, leverage, commission,
                 signals_at_open=signals[signal_index:signal_index + PREDICTION_HORIZON],
             )
-            returns.append(trade_return)
-            index += bars_held + 1
+            if account is None:
+                executions.append(execution)
+            else:
+                account.record_trade(execution, future_candles, margin)
 
+            index += execution["bars_held"] + 1
+
+        if account is not None:
+            return account.summary()
+
+        returns = [execution["net_return"] for execution in executions]
         result = summarize_returns(returns)
         result["confidence"] = confidence
+        result["executions"] = executions
         return result
+    
     validation_model = train_model(X_fit, y_fit)
     validation_results = [
         evaluate(validation_model, value, validation_start, validation_end)
@@ -309,6 +458,14 @@ def run_test_window(
 
     test_model = train_model(X_refit, y_refit)
     result = evaluate(test_model, selected["confidence"], train_end, test_stop)
+    if replay_account:
+        result["paper_account"] = evaluate(
+            test_model,
+            selected["confidence"],
+            train_end,
+            test_stop,
+            account=_PaperAccountReplay(stop_loss, leverage, commission),
+        )
     passed = (
         result["trades"] >= 10
         and result["profit_factor"] >= 1.1
@@ -620,6 +777,7 @@ def run_backtest(symbol="BTCUSDT", *, candles=None):
         "avg_return", "total_return", "max_drawdown", "profit_factor"
     )
     result = {key: holdout[key] for key in keys}
+    result["executions"] = holdout["executions"]
     result.update({
         "symbol": symbol,
         "status": final_status,
