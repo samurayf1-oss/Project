@@ -4,6 +4,7 @@ venv/
 .vscode/
 signals_log.csv
 selected_symbols.csv
+selected_symbols.csv.lock
 live_signals.csv
 paper_trades.csv
 paper_trades.csv.look
