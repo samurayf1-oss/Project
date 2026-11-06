@@ -10,6 +10,9 @@ from features import (
 )
 from model import train_model
 from time import sleep
+from process_lock import exclusive_file_lock
+
+SIGNALS_FILE = "live_signals.csv"
 
 def load_selected_symbols(filename="selected_symbols.csv"):
     symbols = []
@@ -199,9 +202,7 @@ def main(last_processed=None):
     if not signals:
         return
 
-    with open(
-        "live_signals.csv", "a", newline="", encoding="utf-8"
-    ) as file:
+    with open(SIGNALS_FILE, "a", newline="", encoding="utf-8") as file:
         csv.writer(file).writerows(signals)
 
     if last_processed is not None:
@@ -213,24 +214,25 @@ def main(last_processed=None):
     for _, symbol, signal, confidence, reason in signals:
         print(symbol, "|", signal, "|", confidence, "|", reason)
 
-    print("Saved live signals to live_signals.csv", flush=True)
+        print(f"Saved live signals to {SIGNALS_FILE}", flush=True)
 
 if __name__ == "__main__":
     last_processed = {}
 
     try:
-        while True:
-            try:
-                main(last_processed)
-            except Exception as error:
-                print(
-                    "signal cycle failed:",
-                    type(error).__name__,
-                    str(error),
-                    flush=True
-                )
+        with exclusive_file_lock(SIGNALS_FILE, "Signal writer"):
+            while True:
+                try:
+                    main(last_processed)
+                except Exception as error:
+                    print(
+                        "signal cycle failed:",
+                        type(error).__name__,
+                        str(error),
+                        flush=True
+                    )
 
-            sleep(15)
+                sleep(15)
 
     except KeyboardInterrupt:
         print("\nLive signals stopped.")
